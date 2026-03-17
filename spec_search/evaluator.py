@@ -58,39 +58,23 @@ def check_parallel_trends(
     max_pre_sig = max_pre_sig or config.PT_MAX_PRE_SIGNIFICANT
     min_post_consecutive = min_post_consecutive or config.PT_MIN_POST_CONSECUTIVE
 
-    # 检查 1: 事前显著期数
+    # 检查 1: 事前显著期数（使用 1-star 阈值 p<0.10）
     if pt.n_pre_sig > max_pre_sig:
         return False
 
-    # 检查 2: 事后方向正确
-    if not pt.post_correct_sign:
-        return False
-
-    # 检查 3: 事后连续显著（≥2星, p < 0.05）
-    # 重新计算：只计 p < 0.05 的为"显著"
-    post_pval_threshold = config.PT_POST_MIN_PVAL if require_post_2star else 0.10
-    post_periods = sorted([p for p in pt.period_pval if p > 0])
-
-    # 计算连续 ≥2星 显著期数
-    max_consecutive_2star = 0
-    current_streak = 0
-    expected_sign = config.EXPECTED_SIGN.get(chapter, 0)
-
-    for p in post_periods:
-        pval = pt.period_pval.get(p, 1.0)
-        coef = pt.period_coefs.get(p, 0.0)
-        sign_ok = (expected_sign < 0 and coef < 0) or \
-                  (expected_sign > 0 and coef > 0) or \
-                  expected_sign == 0
-
-        if pval < post_pval_threshold and sign_ok:
-            current_streak += 1
-            max_consecutive_2star = max(max_consecutive_2star, current_streak)
-        else:
-            current_streak = 0
-
-    if max_consecutive_2star < min_post_consecutive:
-        return False
+    # 检查 2+3: 事后连续显著 + 方向正确
+    if require_post_2star:
+        # 使用预计算的 2-star 字段（p<0.05 + 方向正确）
+        if not pt.post_correct_sign_2star:
+            return False
+        if pt.max_post_consecutive_2star < min_post_consecutive:
+            return False
+    else:
+        # 放宽模式: 1-star (p<0.10)
+        if not pt.post_correct_sign:
+            return False
+        if pt.max_post_consecutive < min_post_consecutive:
+            return False
 
     return True
 
@@ -188,42 +172,20 @@ def evaluate_parallel_trends(pt: PTResult, chapter: int) -> float:
 
     score = 0.0
 
-    # 事前不显著越多越好
+    # 事前不显著越多越好（1-star 计数）
     max_possible_pre = abs(pt.pre_window)
     n_pre_insig = max_possible_pre - pt.n_pre_sig
     score += n_pre_insig * 20
 
-    # 事后连续≥2星显著期数（重新计算）
-    post_pval_threshold = config.PT_POST_MIN_PVAL
-    post_periods = sorted([p for p in pt.period_pval if p > 0])
-    expected_sign = config.EXPECTED_SIGN.get(chapter, 0)
-
-    max_consecutive_2star = 0
-    current_streak = 0
-    total_2star = 0
-
-    for p in post_periods:
-        pval = pt.period_pval.get(p, 1.0)
-        coef = pt.period_coefs.get(p, 0.0)
-        sign_ok = (expected_sign < 0 and coef < 0) or \
-                  (expected_sign > 0 and coef > 0) or \
-                  expected_sign == 0
-
-        if pval < post_pval_threshold and sign_ok:
-            current_streak += 1
-            total_2star += 1
-            max_consecutive_2star = max(max_consecutive_2star, current_streak)
-        else:
-            current_streak = 0
-
+    # 使用预计算的 2-star 字段（不再重复遍历期间）
     # 连续≥2星显著越多越好（核心指标）
-    score += max_consecutive_2star * 40
+    score += pt.max_post_consecutive_2star * 40
 
     # 总≥2星显著期数
-    score += total_2star * 15
+    score += pt.n_post_sig_2star * 15
 
-    # 事后方向正确
-    if pt.post_correct_sign:
+    # 事后方向正确（2-star level）
+    if pt.post_correct_sign_2star:
         score += 50
 
     # 样本量
