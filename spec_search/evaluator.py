@@ -3,6 +3,11 @@
 结果评估器
 ============================================================
 根据硬性约束和评分函数筛选最优设定
+
+优先级（第3/4章）:
+  1. 平行趋势通过（事后≥2期连续≥2星显著 + 方向正确）
+  2. 主回归≥2星显著 + 方向正确
+  3. 跨章一致性（同X同区间）
 """
 
 import numpy as np
@@ -34,54 +39,58 @@ def check_sign(coef: float, chapter: int) -> bool:
 
 def check_parallel_trends(
     pt: PTResult,
+    chapter: int = 3,
     max_pre_sig: int | None = None,
     min_post_consecutive: int | None = None,
-    max_post_lag: int | None = None,
+    require_post_2star: bool = True,
 ) -> bool:
     """
     检查平行趋势是否满足硬性约束:
 
     1. 事前最多 max_pre_sig 期显著（默认1）
     2. 事后至少 min_post_consecutive 期连续显著（默认2）
-    3. 滞后效应最多 max_post_lag 年（默认2）
+    3. 事后显著系数方向正确
+    4. 事后显著系数 ≥2星 (p < 0.05)（Ch3/Ch4 强制要求）
     """
     if not pt.success:
         return False
 
     max_pre_sig = max_pre_sig or config.PT_MAX_PRE_SIGNIFICANT
     min_post_consecutive = min_post_consecutive or config.PT_MIN_POST_CONSECUTIVE
-    max_post_lag = max_post_lag or config.PT_MAX_POST_LAG
 
     # 检查 1: 事前显著期数
     if pt.n_pre_sig > max_pre_sig:
         return False
 
-    # 检查 2: 事后至少连续两期显著
-    if pt.max_post_consecutive < min_post_consecutive:
-        return False
-
-    # 检查 3: 事后方向正确
+    # 检查 2: 事后方向正确
     if not pt.post_correct_sign:
         return False
 
-    # 检查 4: 滞后效应不超过限制
-    # 找到最后一个显著的事后期
+    # 检查 3: 事后连续显著（≥2星, p < 0.05）
+    # 重新计算：只计 p < 0.05 的为"显著"
+    post_pval_threshold = config.PT_POST_MIN_PVAL if require_post_2star else 0.10
     post_periods = sorted([p for p in pt.period_pval if p > 0])
-    last_sig_period = 0
-    for p in reversed(post_periods):
-        if pt.period_pval.get(p, 1.0) < 0.10:
-            last_sig_period = p
-            break
 
-    # 滞后效应: 从首次显著到最后显著
-    first_sig_period = 0
+    # 计算连续 ≥2星 显著期数
+    max_consecutive_2star = 0
+    current_streak = 0
+    expected_sign = config.EXPECTED_SIGN.get(chapter, 0)
+
     for p in post_periods:
-        if pt.period_pval.get(p, 1.0) < 0.10:
-            first_sig_period = p
-            break
+        pval = pt.period_pval.get(p, 1.0)
+        coef = pt.period_coefs.get(p, 0.0)
+        sign_ok = (expected_sign < 0 and coef < 0) or \
+                  (expected_sign > 0 and coef > 0) or \
+                  expected_sign == 0
 
-    # 允许效应持续 max_post_lag 年后消退
-    # 这里不严格限制最后显著期，因为已经通过连续性检验
+        if pval < post_pval_threshold and sign_ok:
+            current_streak += 1
+            max_consecutive_2star = max(max_consecutive_2star, current_streak)
+        else:
+            current_streak = 0
+
+    if max_consecutive_2star < min_post_consecutive:
+        return False
 
     return True
 
@@ -89,12 +98,6 @@ def check_parallel_trends(
 def evaluate_regression(result: RegressionResult, chapter: int) -> float:
     """
     对回归结果打分。
-
-    评分维度:
-    - 显著性水平 (权重最高)
-    - 方向正确性 (必须)
-    - 样本量
-    - R²
 
     Returns
     -------
@@ -137,9 +140,40 @@ def evaluate_regression(result: RegressionResult, chapter: int) -> float:
     return score
 
 
+def evaluate_regression_relaxed(result: RegressionResult, chapter: int) -> float:
+    """
+    对回归结果打分（放宽版: 允许1星通过，用于 Phase 2 → Phase 3 筛选）。
+    仅要求方向正确 + p < 0.10。
+    """
+    if not result.success:
+        return float("-inf")
+    if not check_sign(result.coef, chapter):
+        return float("-inf")
+    if not check_significance(result.pval, 0.10):
+        return float("-inf")
+
+    score = 0.0
+    if result.pval < 0.01:
+        score += 100
+    elif result.pval < 0.05:
+        score += 60
+    elif result.pval < 0.10:
+        score += 30
+
+    if result.se > 0:
+        score += min(abs(result.tstat), 10) * 5
+    if result.nobs > 0:
+        score += np.log(result.nobs) * 2
+    if not np.isnan(result.r2):
+        score += result.r2 * 20
+
+    return score
+
+
 def evaluate_parallel_trends(pt: PTResult, chapter: int) -> float:
     """
     对平行趋势结果打分。
+    要求事后系数≥2星显著 + 方向正确。
 
     Returns
     -------
@@ -149,7 +183,7 @@ def evaluate_parallel_trends(pt: PTResult, chapter: int) -> float:
     if not pt.success:
         return float("-inf")
 
-    if not check_parallel_trends(pt):
+    if not check_parallel_trends(pt, chapter=chapter, require_post_2star=True):
         return float("-inf")
 
     score = 0.0
@@ -159,8 +193,34 @@ def evaluate_parallel_trends(pt: PTResult, chapter: int) -> float:
     n_pre_insig = max_possible_pre - pt.n_pre_sig
     score += n_pre_insig * 20
 
-    # 事后连续显著越多越好
-    score += pt.max_post_consecutive * 30
+    # 事后连续≥2星显著期数（重新计算）
+    post_pval_threshold = config.PT_POST_MIN_PVAL
+    post_periods = sorted([p for p in pt.period_pval if p > 0])
+    expected_sign = config.EXPECTED_SIGN.get(chapter, 0)
+
+    max_consecutive_2star = 0
+    current_streak = 0
+    total_2star = 0
+
+    for p in post_periods:
+        pval = pt.period_pval.get(p, 1.0)
+        coef = pt.period_coefs.get(p, 0.0)
+        sign_ok = (expected_sign < 0 and coef < 0) or \
+                  (expected_sign > 0 and coef > 0) or \
+                  expected_sign == 0
+
+        if pval < post_pval_threshold and sign_ok:
+            current_streak += 1
+            total_2star += 1
+            max_consecutive_2star = max(max_consecutive_2star, current_streak)
+        else:
+            current_streak = 0
+
+    # 连续≥2星显著越多越好（核心指标）
+    score += max_consecutive_2star * 40
+
+    # 总≥2星显著期数
+    score += total_2star * 15
 
     # 事后方向正确
     if pt.post_correct_sign:
@@ -181,6 +241,8 @@ def evaluate_specification_full(
 ) -> float:
     """
     综合评估一个完整设定（主回归 + 平行趋势）。
+
+    优先级（Ch3/Ch4）: PT通过 > 主回归显著
     """
     reg_score = evaluate_regression(reg_result, chapter)
 
@@ -190,9 +252,12 @@ def evaluate_specification_full(
 
     if pt_result is not None:
         pt_score = evaluate_parallel_trends(pt_result, chapter)
-        if pt_score == float("-inf"):
-            return float("-inf")  # 平行趋势不满足
-        return reg_score + pt_score
+        if pt_score > float("-inf"):
+            # PT 通过: 给予巨大加成，确保 PT-qualified 始终排在前面
+            return reg_score + pt_score + 500
+        else:
+            # PT 未通过：仅保留主回归分数（无加成）
+            return reg_score
     else:
         return reg_score
 
@@ -208,6 +273,8 @@ class CrossChapterResult:
     ch5_best: dict | None = None
     total_score: float = 0.0
     consistent: bool = False
+    ch3_pt_pass: bool = False
+    ch4_pt_pass: bool = False
 
 
 def check_cross_chapter_consistency(
@@ -218,14 +285,14 @@ def check_cross_chapter_consistency(
     """
     检查跨章节一致性:
     - 解释变量相同
-    - 样本区间可以相同或相似
+    - 样本区间相同
+    - 优先选择 Ch3+Ch4 都通过平行趋势的组合
 
     Returns
     -------
     list[CrossChapterResult]
-        按总分排序的跨章节结果
+        按总分排序（PT双通过优先）
     """
-    # 按 (x_var, start_year, end_year) 分组
     from collections import defaultdict
 
     ch3_by_x = defaultdict(list)
@@ -252,16 +319,42 @@ def check_cross_chapter_consistency(
     for key in common_keys:
         x_var, start_year, end_year = key
 
-        best_ch3 = max(ch3_by_x[key], key=lambda r: r.get("score", float("-inf")))
-        best_ch4 = max(ch4_by_x[key], key=lambda r: r.get("score", float("-inf")))
+        # 优先选择 PT-qualified 的结果
+        ch3_list = ch3_by_x[key]
+        ch4_list = ch4_by_x[key]
+
+        # Ch3: 优先 PT 通过的
+        ch3_pt = [r for r in ch3_list if r.get("pt_qualified", False)]
+        best_ch3 = (
+            max(ch3_pt, key=lambda r: r.get("score", float("-inf")))
+            if ch3_pt else
+            max(ch3_list, key=lambda r: r.get("score", float("-inf")))
+        )
+
+        # Ch4: 优先 PT 通过的
+        ch4_pt = [r for r in ch4_list if r.get("pt_qualified", False)]
+        best_ch4 = (
+            max(ch4_pt, key=lambda r: r.get("score", float("-inf")))
+            if ch4_pt else
+            max(ch4_list, key=lambda r: r.get("score", float("-inf")))
+        )
 
         best_ch5 = None
         if key in ch5_by_x and ch5_by_x[key]:
             best_ch5 = max(ch5_by_x[key], key=lambda r: r.get("score", float("-inf")))
 
+        ch3_has_pt = best_ch3.get("pt_qualified", False)
+        ch4_has_pt = best_ch4.get("pt_qualified", False)
+
         total_score = best_ch3.get("score", 0) + best_ch4.get("score", 0)
         if best_ch5:
-            total_score += best_ch5.get("score", 0) * 0.5  # 第五章权重低
+            total_score += best_ch5.get("score", 0) * 0.5
+
+        # 双PT通过 → 巨大加成
+        if ch3_has_pt and ch4_has_pt:
+            total_score += 1000
+        elif ch3_has_pt or ch4_has_pt:
+            total_score += 400
 
         cc = CrossChapterResult(
             x_var=x_var,
@@ -272,6 +365,8 @@ def check_cross_chapter_consistency(
             ch5_best=best_ch5,
             total_score=total_score,
             consistent=True,
+            ch3_pt_pass=ch3_has_pt,
+            ch4_pt_pass=ch4_has_pt,
         )
         results.append(cc)
 

@@ -197,6 +197,8 @@ SIGNIFICANCE_LEVELS = {
 PT_MAX_PRE_SIGNIFICANT = 1      # 事前最多允许1期显著
 PT_MIN_POST_CONSECUTIVE = 2     # 事后至少连续2期显著
 PT_MAX_POST_LAG = 2             # 滞后效应最多2年
+PT_POST_MIN_PVAL = 0.05         # 事后显著系数的最低显著性水平 (≥2星)
+PT_PRIORITY_OVER_MAIN = True    # 平行趋势优先级高于主回归 (Ch3/Ch4)
 
 # 第五章放宽约束
 CH5_RELAXED = True  # 第五章可仅主回归显著，作为稳健性检验

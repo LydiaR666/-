@@ -43,7 +43,8 @@ from spec_search.specification_grid import (
     generate_phase3_pt_grid, generate_psm_grid, generate_robustness_x_grid,
 )
 from spec_search.evaluator import (
-    evaluate_regression, evaluate_parallel_trends,
+    evaluate_regression, evaluate_regression_relaxed,
+    evaluate_parallel_trends,
     check_cross_chapter_consistency, check_sign, check_significance,
 )
 from spec_search.table_generator import save_chapter_tables
@@ -129,10 +130,12 @@ def main():
 
     if cross_results:
         best_cross = cross_results[0]
+        pt_status = (f"Ch3-PT:{'✓' if best_cross.ch3_pt_pass else '✗'} "
+                     f"Ch4-PT:{'✓' if best_cross.ch4_pt_pass else '✗'}")
         log.info(
             f"最优跨章设定: X={best_cross.x_var}, "
             f"区间={best_cross.start_year}-{best_cross.end_year}, "
-            f"总分={best_cross.total_score:.1f}"
+            f"总分={best_cross.total_score:.1f}, {pt_status}"
         )
         if best_cross.ch3_best:
             state.best_specs[3] = best_cross.ch3_best
@@ -207,12 +210,21 @@ def run_chapter_search(
     运行单章完整搜索:
     Phase 1 → 快速扫描 (所有X-Y, 默认设定, 遍历样本区间)
     Phase 2 → 深度搜索 (变化控制变量/FE/聚类/筛选)
-    Phase 3 → 平行趋势检验
+    Phase 3 → 平行趋势检验 (优先级最高: Ch3/Ch4)
+    Phase 4 → 稳健性X检验
+
+    优先级 (Ch3/Ch4):
+      平行趋势≥2星通过 > 主回归显著
+      当无法全部满足时，优先保证PT通过
     """
     all_qualified = []
+    # 放宽候选: p<0.10 即可进入 Phase 3 PT 检验
+    relaxed_candidates = []
+
+    pt_first = (chapter in [3, 4]) and config.PT_PRIORITY_OVER_MAIN
 
     # -------- Phase 1: 快速扫描 --------
-    log.info(f"Phase 1: 快速扫描")
+    log.info(f"Phase 1: 快速扫描{'（PT优先模式）' if pt_first else ''}")
     phase1_specs = generate_phase1_grid(chapter)
     promising_pairs = set()
     phase1_results = []
@@ -232,15 +244,18 @@ def run_chapter_search(
 
         if check_sign(coef, chapter) and check_significance(pval, 0.10):
             promising_pairs.add((spec.y_var, spec.x_var))
-            result["score"] = evaluate_regression(
+            result["score"] = evaluate_regression_relaxed(
                 RegressionResult(coef=coef, pval=pval, nobs=result.get("nobs", 0),
                                  r2=result.get("r2", np.nan), success=True),
                 chapter,
             )
+            # 放宽候选（方向正确 + p<0.10）全部保留供 Phase 3 使用
+            relaxed_candidates.append(result)
             if check_significance(pval, 0.05):
                 all_qualified.append(result)
 
-    log.info(f"  Phase 1: {len(promising_pairs)} 组合方向正确, {len(all_qualified)} 个≥2星")
+    log.info(f"  Phase 1: {len(promising_pairs)} 组合方向正确, "
+             f"{len(all_qualified)} 个≥2星, {len(relaxed_candidates)} 个≥1星")
 
     if not promising_pairs:
         log.warning("  Phase 1 无方向正确组合，放宽条件...")
@@ -278,29 +293,39 @@ def run_chapter_search(
         coef = result.get("coef", np.nan)
         pval = result.get("pval", np.nan)
 
-        if check_sign(coef, chapter) and check_significance(pval, 0.05):
-            result["score"] = evaluate_regression(
-                RegressionResult(coef=coef, pval=pval, nobs=result.get("nobs", 0),
-                                 r2=result.get("r2", np.nan), success=True),
-                chapter,
-            )
-            all_qualified.append(result)
+        if check_sign(coef, chapter):
+            if check_significance(pval, 0.05):
+                result["score"] = evaluate_regression(
+                    RegressionResult(coef=coef, pval=pval, nobs=result.get("nobs", 0),
+                                     r2=result.get("r2", np.nan), success=True),
+                    chapter,
+                )
+                all_qualified.append(result)
+            # PT优先模式: p<0.10 也保留，供 Phase 3 PT 检验使用
+            if pt_first and check_significance(pval, 0.10):
+                result["score"] = evaluate_regression_relaxed(
+                    RegressionResult(coef=coef, pval=pval, nobs=result.get("nobs", 0),
+                                     r2=result.get("r2", np.nan), success=True),
+                    chapter,
+                )
+                relaxed_candidates.append(result)
 
-    log.info(f"  Phase 2: 共 {len(all_qualified)} 个合格结果")
+    log.info(f"  Phase 2: {len(all_qualified)} 个≥2星, {len(relaxed_candidates)} 个≥1星候选")
 
-    if not all_qualified:
-        log.warning("  未找到满足约束的设定")
-        return all_qualified
+    # -------- Phase 3: 平行趋势（优先级最高）--------
+    log.info(f"Phase 3: 平行趋势检验{'（PT优先: 事后≥2星显著）' if pt_first else ''}")
 
-    # -------- Phase 3: 平行趋势 --------
-    log.info(f"Phase 3: 平行趋势检验")
+    # PT优先模式: 从放宽候选（p<0.10）中选取 Top 进入 PT 检验
+    candidates_for_pt = relaxed_candidates if pt_first else all_qualified
+    if not candidates_for_pt:
+        candidates_for_pt = all_qualified
 
-    all_qualified.sort(key=lambda r: r.get("score", float("-inf")), reverse=True)
+    candidates_for_pt.sort(key=lambda r: r.get("score", float("-inf")), reverse=True)
 
     # 去重取 Top 设定
     top_specs = []
     seen = set()
-    for r in all_qualified[:80]:
+    for r in candidates_for_pt[:120]:  # PT优先: 扩大候选池
         key = (r["y_var"], r["x_var"], r.get("controls_group", ""),
                "+".join(r.get("fe_vars", [])), "+".join(r.get("cluster_vars", [])),
                r.get("start_year", 0), r.get("end_year", 0))
@@ -317,8 +342,9 @@ def run_chapter_search(
                 filters=r.get("filters", {}),
             ))
 
-    if len(top_specs) > 30:
-        top_specs = top_specs[:30]
+    max_top = 50 if pt_first else 30  # PT优先: 更多候选进入PT检验
+    if len(top_specs) > max_top:
+        top_specs = top_specs[:max_top]
 
     pt_specs = generate_phase3_pt_grid(chapter, top_specs)
     n_total = len(pt_specs)
@@ -334,7 +360,9 @@ def run_chapter_search(
 
         pt_score = evaluate_parallel_trends(pt_result, chapter)
         if pt_score > float("-inf"):
-            matching = [r for r in all_qualified
+            # PT 通过: 事后≥2期连续≥2星显著 + 方向正确
+            # 在 candidates 中查找匹配的主回归结果
+            matching = [r for r in (all_qualified + relaxed_candidates)
                         if r["y_var"] == spec.y_var and r["x_var"] == spec.x_var
                         and r.get("start_year") == spec.start_year
                         and r.get("end_year") == spec.end_year
@@ -344,23 +372,33 @@ def run_chapter_search(
                 best_match = max(matching, key=lambda r: r.get("score", float("-inf")))
                 record = best_match.copy()
                 record["pt_score"] = pt_score
-                record["score"] = best_match.get("score", 0) + pt_score
+                record["pt_qualified"] = True  # 标记PT通过
+                # PT优先模式: PT通过给予+500加成，确保排序优先
+                record["score"] = best_match.get("score", 0) + pt_score + 500
                 record["pt_result"] = pt_result
                 record["pt_pre_window"] = spec.pt_pre_window
                 record["pt_post_window"] = spec.pt_post_window
                 record["pt_base_period"] = spec.pt_base_period
                 pt_qualified.append(record)
 
-    log.info(f"  Phase 3: {len(pt_qualified)} 个通过平行趋势")
+    log.info(f"  Phase 3: {len(pt_qualified)} 个通过平行趋势（事后≥2星）")
 
     if pt_qualified:
         pt_qualified.sort(key=lambda r: r.get("score", float("-inf")), reverse=True)
-        final_results = pt_qualified
+        # PT优先: PT通过的结果放在最前面
+        non_pt = [r for r in all_qualified
+                  if not any(r.get("y_var") == p.get("y_var") and
+                            r.get("x_var") == p.get("x_var") and
+                            r.get("start_year") == p.get("start_year") and
+                            r.get("end_year") == p.get("end_year") and
+                            r.get("controls_group") == p.get("controls_group")
+                            for p in pt_qualified)]
+        final_results = pt_qualified + non_pt[:10]
     elif is_ch5_robustness:
         log.info("  第5章作为稳健性检验，不要求平行趋势")
         final_results = all_qualified[:30]
     else:
-        log.warning("  无设定通过平行趋势，返回主回归最优结果")
+        log.warning("  无设定通过平行趋势（事后≥2星），返回主回归最优结果")
         final_results = all_qualified[:30]
 
     # -------- Phase 4: 稳健性X检验 --------
