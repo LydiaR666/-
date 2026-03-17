@@ -255,6 +255,34 @@ for ch_key in ["Chapter3", "Chapter4", "Chapter5"]:
     print(f"    X={x_var}, N={spec.get('nobs', 0)}, "
           f"period={spec.get('start_year', '')}-{spec.get('end_year', '')}")
 
+    # 验证 PT 结果（第3/4章强制要求）
+    if ch in [3, 4]:
+        pt_summary = spec.get("pt_summary")
+        if pt_summary:
+            n_pre = pt_summary.get("n_pre_sig", 999)
+            max_consec_2star = pt_summary.get("max_post_consecutive_2star", 0)
+            sign_2star = pt_summary.get("post_correct_sign_2star", False)
+            pt_qualified = spec.get("pt_qualified", False)
+
+            pt_ok = pt_qualified and max_consec_2star >= config.PT_MIN_POST_CONSECUTIVE
+            print(f"    PT: pre_sig={n_pre}, post_consec_2★={max_consec_2star}, "
+                  f"sign_2★={'✓' if sign_2star else '✗'}, "
+                  f"qualified={'✓' if pt_qualified else '✗'}")
+
+            # PT 事前期系数打印
+            periods_data = pt_summary.get("periods", {})
+            for p_str in sorted(periods_data.keys(), key=lambda x: int(x)):
+                p_int = int(p_str)
+                pd_info = periods_data[p_str]
+                pv = pd_info["pval"]
+                c = pd_info["coef"]
+                star = "***" if pv < 0.01 else ("**" if pv < 0.05 else ("*" if pv < 0.10 else ""))
+                flag = " ← PRE-SIG!" if p_int < 0 and pv < 0.10 else (
+                       " ← POST✓" if p_int > 0 and pv < 0.05 and sign_2star else "")
+                print(f"      t={p_int:+d}: coef={c:.4f}, p={pv:.4f}{star}{flag}")
+        else:
+            print(f"    PT: 无 pt_summary (未通过或未运行)")
+
 # 检查 X 一致性
 x_vars = set()
 periods = set()

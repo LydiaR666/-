@@ -875,7 +875,35 @@ def save_search_log(state: SearchState, output_dir: str):
         if best:
             info = {}
             for k, v in best.items():
-                if k in ("reg_result", "pt_result"):
+                if k == "reg_result":
+                    continue
+                if k == "pt_result":
+                    # 序列化 PTResult 的关键统计字段
+                    pt = v
+                    if pt and pt.success:
+                        info["pt_summary"] = {
+                            "success": pt.success,
+                            "nobs": int(pt.nobs),
+                            "r2": float(pt.r2) if not np.isnan(pt.r2) else None,
+                            "n_pre_sig": pt.n_pre_sig,
+                            "n_pre_sig_2star": pt.n_pre_sig_2star,
+                            "n_post_sig": pt.n_post_sig,
+                            "n_post_sig_2star": pt.n_post_sig_2star,
+                            "max_post_consecutive": pt.max_post_consecutive,
+                            "max_post_consecutive_2star": pt.max_post_consecutive_2star,
+                            "post_correct_sign": pt.post_correct_sign,
+                            "post_correct_sign_2star": pt.post_correct_sign_2star,
+                            "periods": {
+                                str(p): {
+                                    "coef": float(c),
+                                    "pval": float(pt.period_pval.get(p, 1.0)),
+                                    "se": float(pt.period_se.get(p, 0.0)),
+                                    "ci_lo": float(pt.period_ci_lower.get(p, 0.0)),
+                                    "ci_hi": float(pt.period_ci_upper.get(p, 0.0)),
+                                }
+                                for p, c in sorted(pt.period_coefs.items())
+                            },
+                        }
                     continue
                 if isinstance(v, (np.floating, np.integer)):
                     info[k] = float(v)
