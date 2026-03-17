@@ -40,7 +40,7 @@ from spec_search.regression_engine import (
 )
 from spec_search.specification_grid import (
     SpecConfig, generate_phase1_grid, generate_phase2_grid,
-    generate_phase3_pt_grid, generate_psm_grid,
+    generate_phase3_pt_grid, generate_psm_grid, generate_robustness_x_grid,
 )
 from spec_search.evaluator import (
     evaluate_regression, evaluate_parallel_trends,
@@ -355,14 +355,49 @@ def run_chapter_search(
 
     if pt_qualified:
         pt_qualified.sort(key=lambda r: r.get("score", float("-inf")), reverse=True)
-        return pt_qualified
-
-    if is_ch5_robustness:
+        final_results = pt_qualified
+    elif is_ch5_robustness:
         log.info("  第5章作为稳健性检验，不要求平行趋势")
-        return all_qualified[:30]
+        final_results = all_qualified[:30]
+    else:
+        log.warning("  无设定通过平行趋势，返回主回归最优结果")
+        final_results = all_qualified[:30]
 
-    log.warning("  无设定通过平行趋势，返回主回归最优结果")
-    return all_qualified[:30]
+    # -------- Phase 4: 稳健性X检验 --------
+    if final_results:
+        log.info(f"Phase 4: 稳健性X变量检验")
+        best_result = final_results[0]
+        best_spec = SpecConfig(
+            chapter=chapter, y_var=best_result["y_var"], x_var=best_result["x_var"],
+            controls_group=best_result.get("controls_group", ""),
+            controls=best_result.get("controls", []),
+            fe_vars=best_result.get("fe_vars", []),
+            cluster_vars=best_result.get("cluster_vars", []),
+            start_year=best_result.get("start_year", 2007),
+            end_year=best_result.get("end_year", 2023),
+            filters=best_result.get("filters", {}),
+            pt_pre_window=best_result.get("pt_pre_window", -3),
+            pt_post_window=best_result.get("pt_post_window", 3),
+            pt_base_period=best_result.get("pt_base_period", "pre1"),
+        )
+        rob_specs = generate_robustness_x_grid(chapter, best_spec)
+        rob_results = []
+        for spec in rob_specs:
+            r = _run_single_spec(raw_df, spec)
+            if r and check_sign(r.get("coef", np.nan), chapter):
+                r["score"] = evaluate_regression(
+                    RegressionResult(coef=r["coef"], pval=r["pval"],
+                                     nobs=r["nobs"], r2=r["r2"], success=True),
+                    chapter,
+                )
+                r["is_robustness_x"] = True
+                rob_results.append(r)
+        n_sig = sum(1 for r in rob_results if check_significance(r.get("pval", 1), 0.05))
+        log.info(f"  稳健性X: {n_sig}/{len(rob_results)} 个方向正确且≥2星")
+        # 附加到结果（标记为稳健性）
+        final_results.extend(rob_results)
+
+    return final_results
 
 
 def _run_single_spec(raw_df: pd.DataFrame, spec: SpecConfig) -> dict | None:
@@ -442,7 +477,16 @@ def generate_chapter_output(
     chapter: int,
     output_dir: str,
 ):
-    """为一章生成完整输出: 表格(docx) + 图形(png) + Stata代码(do)。"""
+    """
+    为一章生成完整输出（5-7 个文件）：
+    1. 描述统计表.docx
+    2. 相关系数表.docx
+    3. 主回归表.docx（含多列 Y；如有PSM则含匹配前基准+平衡性+匹配后）
+    4. 平行趋势检验表.docx
+    5-7. 动态效应图.png
+    """
+    from docx import Document
+
     ch_dir = os.path.join(output_dir, f"Chapter{chapter}")
     os.makedirs(ch_dir, exist_ok=True)
 
@@ -450,7 +494,7 @@ def generate_chapter_output(
     log.info(f"  X={best['x_var']}, Y={best['y_var']}, "
              f"区间={best['start_year']}-{best['end_year']}")
 
-    # 准备统一样本
+    # ---- 准备统一样本 ----
     set_verbose(True)
     df = apply_sample_filters(
         raw_df, best["start_year"], best["end_year"], best.get("filters", {}),
@@ -463,62 +507,74 @@ def generate_chapter_output(
         cont_vars = get_continuous_vars(df, [best["y_var"], best["x_var"]] + controls)
         df = winsorize_variables(df, cont_vars, winsorize_level)
 
-    # Listwise deletion 确保 N 一致
+    # Listwise deletion：确保章内所有表格的 N 完全一致
     all_vars = [best["y_var"], best["x_var"]] + controls
     available_vars = [v for v in all_vars if v in df.columns]
     df_complete = df.dropna(subset=available_vars)
     log.info(f"  统一样本 N={len(df_complete)}")
 
-    # 1. 描述统计
-    stats_vars = [best["x_var"], best["y_var"]] + controls
-    stats_vars = list(dict.fromkeys(v for v in stats_vars if v in df_complete.columns))
-    desc_stats = compute_descriptive_stats(df_complete, stats_vars)
-
-    # 2. 相关系数
-    corr_vars = [best["x_var"], best["y_var"]] + controls[:8]
-    corr_vars = list(dict.fromkeys(v for v in corr_vars if v in df_complete.columns))
-    corr_matrix = compute_correlation_matrix(df_complete, corr_vars)
-
-    # 3. 主回归 — 收集同一 X 下的多个 Y 结果
-    main_results = []
     best_x = best["x_var"]
     best_fe = best.get("fe_vars", [])
     best_cl = best.get("cluster_vars", [])
 
-    # 找同一设定下的其他 Y（同X、同控制变量组、同区间）
+    # ---- 收集同X的多个Y结果 ----
     same_spec_results = [
         r for r in all_results
         if r["x_var"] == best_x
         and r.get("controls_group") == best.get("controls_group")
         and r.get("start_year") == best.get("start_year")
         and r.get("end_year") == best.get("end_year")
+        and not r.get("is_robustness_x", False)
     ]
-
-    # 按 Y 去重，取最优
     y_best = {}
     for r in same_spec_results:
         yv = r["y_var"]
         if yv not in y_best or r.get("score", 0) > y_best[yv].get("score", 0):
             y_best[yv] = r
 
-    # 主回归表: 先放 best Y，然后加其他显著的 Y
+    # 收集 RegressionResult 列表（最多6列）
+    main_results = []
     if best.get("reg_result"):
         main_results.append(best["reg_result"])
-
     for yv, r in sorted(y_best.items(), key=lambda x: x[1].get("score", 0), reverse=True):
         if yv != best["y_var"] and r.get("reg_result") and len(main_results) < 6:
             main_results.append(r["reg_result"])
-
-    # 如果只有1个结果，用完整样本重新跑
     if not main_results:
-        main_result = run_ols_fe(
-            df_complete, best["y_var"], best["x_var"],
-            controls, best_fe, best_cl,
-        )
-        if main_result.success:
-            main_results = [main_result]
+        reg = run_ols_fe(df_complete, best["y_var"], best["x_var"], controls, best_fe, best_cl)
+        if reg.success:
+            main_results = [reg]
 
-    # 4. PSM-DID
+    # ---- 1. 描述统计表 ----
+    stats_vars = list(dict.fromkeys(
+        [best["x_var"], best["y_var"]] + controls
+    ))
+    stats_vars = [v for v in stats_vars if v in df_complete.columns]
+    desc_stats = compute_descriptive_stats(df_complete, stats_vars)
+
+    from spec_search.table_generator import (
+        create_descriptive_stats_table, create_correlation_table,
+        create_main_regression_table, create_psm_balance_table,
+        create_parallel_trends_table, _add_table_border,
+    )
+
+    doc1 = Document()
+    create_descriptive_stats_table(doc1, desc_stats, "主要变量描述统计", chapter)
+    doc1.save(os.path.join(ch_dir, f"表{chapter}-1_描述统计表.docx"))
+    log.info(f"  表{chapter}-1 描述统计表")
+
+    # ---- 2. 相关系数表 ----
+    corr_vars = list(dict.fromkeys(
+        [best["x_var"], best["y_var"]] + controls[:8]
+    ))
+    corr_vars = [v for v in corr_vars if v in df_complete.columns]
+    corr_matrix = compute_correlation_matrix(df_complete, corr_vars)
+
+    doc2 = Document()
+    create_correlation_table(doc2, corr_matrix, "主要变量Pearson相关系数矩阵", chapter)
+    doc2.save(os.path.join(ch_dir, f"表{chapter}-2_相关系数表.docx"))
+    log.info(f"  表{chapter}-2 相关系数表")
+
+    # ---- 3. PSM-DID ----
     psm_result = None
     try:
         psm_result = run_psm_did(
@@ -531,7 +587,53 @@ def generate_chapter_output(
     except Exception:
         pass
 
-    # 5. 平行趋势
+    # ---- 3a. 主回归表 ----
+    table_num = 3
+    doc3 = Document()
+    if psm_result:
+        # 匹配前基准回归
+        create_main_regression_table(
+            doc3, [psm_result.baseline_result] if psm_result.baseline_result.success else main_results,
+            "基准回归结果（全样本）", chapter, table_num, controls,
+        )
+        table_num += 1
+
+        # PSM 平衡性检验
+        create_psm_balance_table(doc3, psm_result, "PSM平衡性检验", chapter, table_num)
+        table_num += 1
+
+        # 匹配后回归
+        create_main_regression_table(
+            doc3, [psm_result.psm_result] if psm_result.psm_result.success else [],
+            "PSM-DID回归结果（匹配后）", chapter, table_num, controls,
+        )
+        table_num += 1
+    else:
+        # 多列主回归表（每列一个Y）
+        create_main_regression_table(
+            doc3, main_results, "基准回归结果", chapter, table_num, controls,
+        )
+        table_num += 1
+
+    doc3.save(os.path.join(ch_dir, f"表{chapter}-3_主回归表.docx"))
+    log.info(f"  表{chapter}-3 主回归表 ({len(main_results)} 列)")
+
+    # ---- 4. 稳健性检验表（替代X变量）----
+    rob_results_x = [r for r in all_results if r.get("is_robustness_x", False)]
+    if rob_results_x:
+        rob_reg_results = [r.get("reg_result") for r in rob_results_x
+                           if r.get("reg_result") and r["reg_result"].success]
+        if rob_reg_results:
+            doc_rob = Document()
+            create_main_regression_table(
+                doc_rob, rob_reg_results[:6],
+                "稳健性检验：替代解释变量", chapter, table_num, controls,
+            )
+            doc_rob.save(os.path.join(ch_dir, f"表{chapter}-{table_num}_稳健性替代X.docx"))
+            log.info(f"  表{chapter}-{table_num} 稳健性替代X ({len(rob_reg_results[:6])} 列)")
+            table_num += 1
+
+    # ---- 5. 平行趋势检验表 ----
     pt_results = []
     pt_result = best.get("pt_result")
     if pt_result is None:
@@ -547,12 +649,40 @@ def generate_chapter_output(
     if pt_result and pt_result.success:
         pt_results.append(pt_result)
 
-    # 对其他 Y 也生成平行趋势（如果有）
+    # 其他 Y 的平行趋势
     for yv, r in y_best.items():
         if yv != best["y_var"] and r.get("pt_result") and len(pt_results) < 4:
             pt_results.append(r["pt_result"])
 
-    # 生成 Word 表格
+    if pt_results:
+        doc_pt = Document()
+        create_parallel_trends_table(
+            doc_pt, pt_results, "平行趋势检验与动态效应", chapter, table_num,
+        )
+        doc_pt.save(os.path.join(ch_dir, f"表{chapter}-{table_num}_平行趋势检验表.docx"))
+        log.info(f"  表{chapter}-{table_num} 平行趋势表 ({len(pt_results)} 列)")
+        table_num += 1
+
+    # ---- 6-7. 动态效应图 ----
+    for pt in pt_results:
+        if pt.success:
+            plot_dynamic_effects(
+                pt,
+                output_path=os.path.join(ch_dir, f"图{chapter}_动态效应_{pt.y_var}.png"),
+                title=f"Ch.{chapter} Dynamic Effects: {pt.y_var}",
+                chapter=chapter,
+                y_label=pt.y_var,
+            )
+
+    if len(pt_results) > 1:
+        plot_multiple_dynamic_effects(
+            pt_results,
+            output_path=os.path.join(ch_dir, f"图{chapter}_动态效应对比.png"),
+            title=f"第{chapter}章 动态效应对比",
+            chapter=chapter,
+        )
+
+    # 也保存合并版
     save_chapter_tables(
         chapter=chapter,
         desc_stats=desc_stats,
@@ -563,26 +693,6 @@ def generate_chapter_output(
         controls_list=controls,
         output_dir=ch_dir,
     )
-
-    # 生成动态效应图
-    for pt in pt_results:
-        if pt.success:
-            plot_dynamic_effects(
-                pt,
-                output_path=os.path.join(ch_dir, f"动态效应图_{pt.y_var}.png"),
-                title=f"Ch.{chapter} Dynamic Effects: {pt.y_var}",
-                chapter=chapter,
-                y_label=pt.y_var,
-            )
-
-    # 多Y对比图
-    if len(pt_results) > 1:
-        plot_multiple_dynamic_effects(
-            pt_results,
-            output_path=os.path.join(ch_dir, f"动态效应对比图.png"),
-            title=f"第{chapter}章 动态效应对比",
-            chapter=chapter,
-        )
 
 
 def save_search_log(state: SearchState, output_dir: str):

@@ -177,11 +177,8 @@ def generate_psm_grid(
     chapter: int,
     best_specs: list[SpecConfig],
 ) -> list[SpecConfig]:
-    """
-    为 Top 设定生成 PSM-DID 变体。
-    """
+    """为 Top 设定生成 PSM-DID 变体。"""
     specs = []
-
     for base_spec in best_specs:
         for psm_cfg in config.PSM_METHODS:
             new_spec = SpecConfig(
@@ -198,6 +195,35 @@ def generate_psm_grid(
                 psm_config=psm_cfg.copy(),
             )
             specs.append(new_spec)
-
     print(f"[PSM] 第{chapter}章: 生成 {len(specs)} 个PSM-DID设定")
+    return specs
+
+
+def generate_robustness_x_grid(
+    chapter: int,
+    best_spec: SpecConfig,
+) -> list[SpecConfig]:
+    """
+    Phase 4: 稳健性检验 — 使用替代 X 变量 (count_DMA_*, ln_amt_DMA_*)。
+    固定其他设定不变，仅替换 X。
+    """
+    specs = []
+    for x_var in config.X_VARS_ROBUSTNESS:
+        new_spec = SpecConfig(
+            chapter=best_spec.chapter,
+            y_var=best_spec.y_var,
+            x_var=x_var,
+            controls_group=best_spec.controls_group,
+            controls=best_spec.controls,
+            fe_vars=best_spec.fe_vars,
+            cluster_vars=best_spec.cluster_vars,
+            start_year=best_spec.start_year,
+            end_year=best_spec.end_year,
+            filters=best_spec.filters.copy(),
+            pt_pre_window=best_spec.pt_pre_window,
+            pt_post_window=best_spec.pt_post_window,
+            pt_base_period=best_spec.pt_base_period,
+        )
+        specs.append(new_spec)
+    print(f"[Robustness X] 第{chapter}章: 生成 {len(specs)} 个替代X设定")
     return specs
