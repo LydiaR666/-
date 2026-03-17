@@ -164,6 +164,7 @@ def main():
 
     save_search_log(state, output_dir)
     generate_stata_code(state, output_dir)
+    generate_summary_report(state, cross_results, output_dir)
 
     log.info("=" * 50)
     log.info(f"完成！耗时: {state.elapsed()}")
@@ -731,6 +732,106 @@ def generate_chapter_output(
         controls_list=controls,
         output_dir=ch_dir,
     )
+
+
+def generate_summary_report(state: SearchState, cross_results, output_dir: str):
+    """生成跨章节汇总报告（文本 + Word）。"""
+    lines = []
+    lines.append("=" * 70)
+    lines.append("  回归设定搜索结果汇总报告")
+    lines.append(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    lines.append("=" * 70)
+
+    for chapter in [3, 4, 5]:
+        best = state.best_specs.get(chapter)
+        if not best:
+            lines.append(f"\n第{chapter}章: 未找到满足约束的设定")
+            continue
+
+        pt_ok = best.get("pt_qualified", False)
+        pt_tag = "PT-PASS(≥2★)" if pt_ok else "PT-FAIL"
+
+        lines.append(f"\n{'─' * 50}")
+        lines.append(f"第{chapter}章  [{pt_tag}]")
+        lines.append(f"{'─' * 50}")
+        lines.append(f"  Y = {best['y_var']}")
+        lines.append(f"  X = {best['x_var']}")
+        lines.append(f"  Controls = {best.get('controls_group', '')}")
+        lines.append(f"  FE = {' + '.join(best.get('fe_vars', []))}")
+        lines.append(f"  Cluster = {' + '.join(best.get('cluster_vars', []))}")
+        lines.append(f"  Sample = {best.get('start_year', '')}-{best.get('end_year', '')}")
+        lines.append(f"  Filters = {best.get('filters', {})}")
+        lines.append(f"  主回归: coef={best.get('coef', 'NA'):.4f}, "
+                     f"p={best.get('pval', 'NA'):.4f}{best.get('stars', '')}, "
+                     f"N={best.get('nobs', 0)}")
+
+        pt_result = best.get("pt_result")
+        if pt_result and pt_result.success:
+            lines.append(f"  平行趋势:")
+            lines.append(f"    事前显著(10%): {pt_result.n_pre_sig} 期 "
+                         f"(≤{config.PT_MAX_PRE_SIGNIFICANT} 期要求)")
+            lines.append(f"    事后显著(5%): {pt_result.n_post_sig_2star} 期")
+            lines.append(f"    事后最大连续(5%): {pt_result.max_post_consecutive_2star} 期 "
+                         f"(≥{config.PT_MIN_POST_CONSECUTIVE} 期要求)")
+            lines.append(f"    事后方向正确(5%): {'是' if pt_result.post_correct_sign_2star else '否'}")
+            lines.append(f"    窗口: [{best.get('pt_pre_window', -3)}, "
+                         f"{best.get('pt_post_window', 3)}], 基期: {best.get('pt_base_period', 'pre1')}")
+
+            # 逐期系数
+            for p in sorted(pt_result.period_coefs.keys()):
+                coef = pt_result.period_coefs[p]
+                pval = pt_result.period_pval.get(p, 1.0)
+                star = "***" if pval < 0.01 else ("**" if pval < 0.05 else ("*" if pval < 0.10 else ""))
+                tag = ""
+                if p < 0 and pval < 0.10:
+                    tag = " ← PRE-SIG!"
+                elif p > 0 and pval < 0.05:
+                    tag = " ← POST-2★ ✓"
+                lines.append(f"    t={p:+d}: coef={coef:.4f}, p={pval:.4f}{star}{tag}")
+        else:
+            lines.append(f"  平行趋势: 未检验或未通过")
+
+    # 跨章一致性
+    lines.append(f"\n{'═' * 50}")
+    lines.append(f"跨章节一致性")
+    lines.append(f"{'═' * 50}")
+
+    if cross_results:
+        best_cc = cross_results[0]
+        lines.append(f"  最优组合: X={best_cc.x_var}, "
+                     f"区间={best_cc.start_year}-{best_cc.end_year}")
+        lines.append(f"  总分: {best_cc.total_score:.1f}")
+        lines.append(f"  Ch3 PT: {'通过(≥2★)' if best_cc.ch3_pt_pass else '未通过'}")
+        lines.append(f"  Ch4 PT: {'通过(≥2★)' if best_cc.ch4_pt_pass else '未通过'}")
+
+        if best_cc.ch3_pt_pass and best_cc.ch4_pt_pass:
+            lines.append(f"  状态: ★★ Ch3+Ch4 双PT通过 — 最优组合 ★★")
+        elif best_cc.ch3_pt_pass or best_cc.ch4_pt_pass:
+            lines.append(f"  状态: ★ 单章PT通过 — 可接受（需手动调整另一章）")
+        else:
+            lines.append(f"  状态: 无PT通过组合 — 需要放宽约束或手动调整")
+
+        # 显示其他候选
+        if len(cross_results) > 1:
+            lines.append(f"\n  其他候选:")
+            for cc in cross_results[1:5]:
+                pt3 = "✓" if cc.ch3_pt_pass else "✗"
+                pt4 = "✓" if cc.ch4_pt_pass else "✗"
+                lines.append(f"    X={cc.x_var}, {cc.start_year}-{cc.end_year}, "
+                             f"score={cc.total_score:.1f}, Ch3-PT:{pt3}, Ch4-PT:{pt4}")
+    else:
+        lines.append("  无跨章一致设定")
+
+    report_text = "\n".join(lines)
+
+    # 保存文本报告
+    report_path = os.path.join(output_dir, "summary_report.txt")
+    with open(report_path, "w", encoding="utf-8") as f:
+        f.write(report_text)
+    log.info(f"汇总报告: {report_path}")
+
+    # 打印到控制台
+    print(report_text)
 
 
 def save_search_log(state: SearchState, output_dir: str):

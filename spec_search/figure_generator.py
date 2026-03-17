@@ -2,6 +2,7 @@
 ============================================================
 图形生成器 — 动态效应图 / 平行趋势图
 ============================================================
+增强版: 事后≥2星显著期用实心标记突出显示
 """
 
 import os
@@ -16,7 +17,6 @@ from .regression_engine import PTResult
 
 def setup_matplotlib():
     """配置 matplotlib 中文字体和样式"""
-    # 尝试中文字体
     for font in ["SimSun", "SimHei", "STSong", "Arial Unicode MS", "PingFang SC",
                   "WenQuanYi Micro Hei", "Noto Sans CJK SC", "DejaVu Sans"]:
         try:
@@ -31,6 +31,41 @@ def setup_matplotlib():
     rcParams["figure.figsize"] = config.FIGURE_SIZE
 
 
+def _get_period_style(p: int, pval: float, chapter: int, coef: float):
+    """
+    根据期间和显著性返回样式。
+
+    事前不显著: 空心灰色 (期望)
+    事前显著: 空心红色 (不期望)
+    事后≥2星+方向正确: 实心深蓝 (期望)
+    事后1星: 半透明蓝
+    事后不显著: 空心灰色
+    """
+    expected = config.EXPECTED_SIGN.get(chapter, 0)
+    sign_ok = (expected < 0 and coef < 0) or (expected > 0 and coef > 0) or expected == 0
+
+    if p < 0:
+        # 事前: 不显著最好
+        if pval < 0.10:
+            return {"color": "#d62728", "marker": "o", "facecolors": "none",
+                    "edgecolors": "#d62728", "s": 50, "zorder": 5}
+        return {"color": "#999999", "marker": "o", "facecolors": "none",
+                "edgecolors": "#999999", "s": 50, "zorder": 5}
+    elif p == 0:
+        return {"color": "#555555", "marker": "D", "facecolors": "none",
+                "edgecolors": "#555555", "s": 55, "zorder": 5}
+    else:
+        # 事后: ≥2星+方向正确最好
+        if pval < 0.05 and sign_ok:
+            return {"color": "#1f77b4", "marker": "o", "facecolors": "#1f77b4",
+                    "edgecolors": "#1f77b4", "s": 70, "zorder": 6}
+        elif pval < 0.10 and sign_ok:
+            return {"color": "#1f77b4", "marker": "o", "facecolors": "#1f77b4",
+                    "edgecolors": "#1f77b4", "s": 50, "zorder": 5, "alpha": 0.5}
+        return {"color": "#999999", "marker": "o", "facecolors": "none",
+                "edgecolors": "#999999", "s": 50, "zorder": 5}
+
+
 def plot_dynamic_effects(
     pt_result: PTResult,
     output_path: str,
@@ -40,26 +75,12 @@ def plot_dynamic_effects(
     show_ci: bool = True,
 ) -> str:
     """
-    绘制事件研究法动态效应图。
+    绘制事件研究法动态效应图（增强版）。
 
-    X轴: 事件时间 (相对于处理年份)
-    Y轴: 系数估计值
-    误差线: 95% 置信区间
-    虚线: t=0 垂直线, y=0 水平线
-
-    Parameters
-    ----------
-    pt_result : PTResult
-    output_path : str
-    title : str
-    chapter : int
-    y_label : str
-    show_ci : bool
-
-    Returns
-    -------
-    str
-        保存的文件路径
+    - 事后≥2星显著期: 实心大标记
+    - 事前显著期: 红色空心标记（不期望）
+    - 95% CI 阴影
+    - PT 检验状态注释
     """
     setup_matplotlib()
 
@@ -67,7 +88,6 @@ def plot_dynamic_effects(
         print(f"[图形] 无法生成: {pt_result.error_msg}")
         return ""
 
-    # 提取数据
     periods = sorted(pt_result.period_coefs.keys())
     coefs = [pt_result.period_coefs[p] for p in periods]
     ci_lower = [pt_result.period_ci_lower.get(p, c - 1.96 * pt_result.period_se.get(p, 0))
@@ -77,27 +97,34 @@ def plot_dynamic_effects(
 
     fig, ax = plt.subplots(figsize=config.FIGURE_SIZE)
 
-    # 绘制置信区间（灰色阴影）
+    # 95% CI 阴影
     if show_ci:
-        ax.fill_between(periods, ci_lower, ci_upper, alpha=0.2, color="steelblue",
+        ax.fill_between(periods, ci_lower, ci_upper, alpha=0.15, color="steelblue",
                         label="95% CI")
 
-    # 绘制系数点和连线
-    ax.plot(periods, coefs, "o-", color="steelblue", markersize=6, linewidth=1.5,
-            label="Coefficient", zorder=5)
+    # 连线（淡灰色）
+    ax.plot(periods, coefs, "-", color="#bbbbbb", linewidth=1.2, zorder=3)
 
     # 误差线
     if show_ci:
         yerr_lower = [c - cl for c, cl in zip(coefs, ci_lower)]
         yerr_upper = [cu - c for c, cu in zip(coefs, ci_upper)]
         ax.errorbar(periods, coefs, yerr=[yerr_lower, yerr_upper],
-                    fmt="none", ecolor="steelblue", capsize=3, alpha=0.6)
+                    fmt="none", ecolor="steelblue", capsize=3, alpha=0.5, zorder=4)
+
+    # 逐点绘制（根据显著性差异化）
+    for p, c in zip(periods, coefs):
+        pval = pt_result.period_pval.get(p, 1.0)
+        style = _get_period_style(p, pval, chapter, c)
+        alpha = style.pop("alpha", 1.0)
+        ax.scatter([p], [c], alpha=alpha, **style)
 
     # 参考线
     ax.axhline(y=0, color="black", linestyle="--", linewidth=0.8, alpha=0.5)
-    ax.axvline(x=0, color="red", linestyle="--", linewidth=0.8, alpha=0.5)
+    ax.axvline(x=-0.5, color="red", linestyle="--", linewidth=0.8, alpha=0.4,
+               label="Treatment")
 
-    # 标注基期
+    # 基期标注
     base_period = pt_result.base_period
     if base_period == "pre1":
         base_x = -1
@@ -112,9 +139,10 @@ def plot_dynamic_effects(
         idx = periods.index(base_x)
         ax.annotate("Base", (base_x, coefs[idx]),
                      textcoords="offset points", xytext=(0, 15),
-                     ha="center", fontsize=9, color="gray")
+                     ha="center", fontsize=9, color="gray",
+                     arrowprops=dict(arrowstyle="-", color="gray", alpha=0.3))
 
-    # 标注显著性
+    # 显著性星号
     for p, c in zip(periods, coefs):
         pval = pt_result.period_pval.get(p, 1.0)
         if pval < 0.01:
@@ -124,24 +152,46 @@ def plot_dynamic_effects(
         elif pval < 0.10:
             marker = "*"
         else:
-            marker = ""
-        if marker:
-            ax.annotate(marker, (p, c),
-                         textcoords="offset points",
-                         xytext=(0, -15 if c > 0 else 10),
-                         ha="center", fontsize=8, color="darkred")
+            continue
+        color = "#d62728" if p < 0 else "#1f77b4"
+        ax.annotate(marker, (p, c),
+                     textcoords="offset points",
+                     xytext=(0, -15 if c > 0 else 10),
+                     ha="center", fontsize=8, fontweight="bold", color=color)
+
+    # PT 状态注释
+    n_pre = pt_result.n_pre_sig
+    n_post_2star = pt_result.n_post_sig_2star
+    max_consec_2star = pt_result.max_post_consecutive_2star
+    pt_status = (f"Pre-sig(10%): {n_pre}  |  "
+                 f"Post-sig(5%): {n_post_2star}  |  "
+                 f"Max consec(5%): {max_consec_2star}")
+    ax.text(0.02, 0.02, pt_status, transform=ax.transAxes,
+            fontsize=7.5, color="#666666", va="bottom",
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8, edgecolor="#cccccc"))
 
     # 格式化
     ax.set_xlabel("Event Time (relative to treatment)", fontsize=11)
     ax.set_ylabel(y_label, fontsize=11)
     ax.set_title(title, fontsize=13, fontweight="bold")
     ax.set_xticks(periods)
-    ax.legend(loc="best", fontsize=9)
+
+    # 图例
+    from matplotlib.lines import Line2D
+    legend_elements = [
+        Line2D([0], [0], marker='o', color='w', markerfacecolor='#1f77b4',
+               markeredgecolor='#1f77b4', markersize=8, label='Post ≥2★ (correct sign)'),
+        Line2D([0], [0], marker='o', color='w', markerfacecolor='none',
+               markeredgecolor='#999999', markersize=7, label='Not significant'),
+        Line2D([0], [0], marker='o', color='w', markerfacecolor='none',
+               markeredgecolor='#d62728', markersize=7, label='Pre-period sig (undesired)'),
+        plt.Rectangle((0, 0), 1, 1, fc='steelblue', alpha=0.15, label='95% CI'),
+    ]
+    ax.legend(handles=legend_elements, loc="best", fontsize=8, framealpha=0.9)
     ax.grid(True, alpha=0.3, linestyle=":")
 
     plt.tight_layout()
 
-    # 保存
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     fig.savefig(output_path, bbox_inches="tight")
     plt.close(fig)
@@ -158,8 +208,7 @@ def plot_multiple_dynamic_effects(
     labels: list[str] | None = None,
 ) -> str:
     """
-    在同一张图上绘制多个被解释变量的动态效应。
-    适用于同一章多个Y变量的对比。
+    多子图动态效应对比（增强版）。
     """
     setup_matplotlib()
 
@@ -168,9 +217,10 @@ def plot_multiple_dynamic_effects(
         print("[图形] 无有效结果")
         return ""
 
+    n_plots = len(valid_results)
     fig, axes = plt.subplots(
-        1, len(valid_results),
-        figsize=(5 * len(valid_results), 5),
+        1, n_plots,
+        figsize=(5 * n_plots, 5),
         squeeze=False,
     )
 
@@ -185,13 +235,53 @@ def plot_multiple_dynamic_effects(
         ci_upper = [pt.period_ci_upper.get(p, c + 1.96 * pt.period_se.get(p, 0))
                     for p, c in zip(periods, coefs)]
 
-        color = colors[idx % len(colors)]
+        base_color = colors[idx % len(colors)]
 
-        ax.fill_between(periods, ci_lower, ci_upper, alpha=0.2, color=color)
-        ax.plot(periods, coefs, "o-", color=color, markersize=5, linewidth=1.5)
+        # CI shade
+        ax.fill_between(periods, ci_lower, ci_upper, alpha=0.15, color=base_color)
+
+        # Line
+        ax.plot(periods, coefs, "-", color="#bbbbbb", linewidth=1.2, zorder=3)
+
+        # Error bars
+        yerr_lower = [c - cl for c, cl in zip(coefs, ci_lower)]
+        yerr_upper = [cu - c for c, cu in zip(coefs, ci_upper)]
+        ax.errorbar(periods, coefs, yerr=[yerr_lower, yerr_upper],
+                    fmt="none", ecolor=base_color, capsize=3, alpha=0.5, zorder=4)
+
+        # Points with differentiated styling
+        for p, c in zip(periods, coefs):
+            pval = pt.period_pval.get(p, 1.0)
+            expected = config.EXPECTED_SIGN.get(chapter, 0)
+            sign_ok = (expected < 0 and c < 0) or (expected > 0 and c > 0) or expected == 0
+
+            if p > 0 and pval < 0.05 and sign_ok:
+                ax.scatter([p], [c], marker="o", s=70, color=base_color, zorder=6)
+            elif p < 0 and pval < 0.10:
+                ax.scatter([p], [c], marker="o", s=50, facecolors="none",
+                          edgecolors="#d62728", zorder=5)
+            else:
+                ax.scatter([p], [c], marker="o", s=50, facecolors="none",
+                          edgecolors="#999999", zorder=5)
+
+        # Stars
+        for p, c in zip(periods, coefs):
+            pval = pt.period_pval.get(p, 1.0)
+            if pval < 0.01:
+                star = "***"
+            elif pval < 0.05:
+                star = "**"
+            elif pval < 0.10:
+                star = "*"
+            else:
+                continue
+            ax.annotate(star, (p, c), textcoords="offset points",
+                       xytext=(0, -13 if c > 0 else 9),
+                       ha="center", fontsize=7, fontweight="bold",
+                       color="#d62728" if p < 0 else base_color)
 
         ax.axhline(y=0, color="black", linestyle="--", linewidth=0.8, alpha=0.5)
-        ax.axvline(x=0, color="red", linestyle="--", linewidth=0.8, alpha=0.5)
+        ax.axvline(x=-0.5, color="red", linestyle="--", linewidth=0.8, alpha=0.4)
 
         label = labels[idx] if labels and idx < len(labels) else pt.y_var
         ax.set_title(label, fontsize=11, fontweight="bold")
@@ -199,6 +289,13 @@ def plot_multiple_dynamic_effects(
         ax.set_ylabel("Coefficient", fontsize=10)
         ax.set_xticks(periods)
         ax.grid(True, alpha=0.3, linestyle=":")
+
+        # PT status
+        status = f"Post≥2★: {pt.max_post_consecutive_2star} consec"
+        ax.text(0.02, 0.02, status, transform=ax.transAxes,
+                fontsize=7, color="#666666", va="bottom",
+                bbox=dict(boxstyle="round,pad=0.2", facecolor="white",
+                         alpha=0.8, edgecolor="#cccccc"))
 
     fig.suptitle(title, fontsize=14, fontweight="bold", y=1.02)
     plt.tight_layout()

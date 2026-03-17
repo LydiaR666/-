@@ -71,10 +71,16 @@ class PTResult:
     r2: float = np.nan
     success: bool = False
     error_msg: str = ""
+    # 1-star (p<0.10) 统计
     n_pre_sig: int = 0
     n_post_sig: int = 0
     max_post_consecutive: int = 0
     post_correct_sign: bool = False
+    # 2-star (p<0.05) 统计 — 用于严格 PT 检验
+    n_pre_sig_2star: int = 0
+    n_post_sig_2star: int = 0
+    max_post_consecutive_2star: int = 0
+    post_correct_sign_2star: bool = False
 
 
 @dataclass
@@ -475,16 +481,29 @@ def _extract_pt_results(fit, event_dummy_cols, periods, omit_period, chapter, pt
     pt.nobs = int(getattr(fit, "nobs", 0))
 
     expected_sign = cfg.EXPECTED_SIGN.get(chapter, -1)
+
+    # 1-star (p<0.10) counters
     n_pre_sig = 0
     n_post_sig = 0
     post_sig_consecutive = 0
     max_post_consecutive = 0
     post_signs_correct = True
 
+    # 2-star (p<0.05) counters
+    n_pre_sig_2star = 0
+    n_post_sig_2star = 0
+    post_sig_consecutive_2star = 0
+    max_post_consecutive_2star = 0
+    post_signs_correct_2star = True
+
     for p, dummy_name in zip(periods, event_dummy_cols):
         if dummy_name in fit.params.index:
             coef = float(fit.params[dummy_name])
-            se_val = float(fit.std_errors[dummy_name]) if hasattr(fit, 'std_errors') else float(fit.bse[dummy_name])
+            # SE: PanelOLS uses std_errors, statsmodels OLS uses bse
+            if hasattr(fit, 'std_errors') and dummy_name in fit.std_errors.index:
+                se_val = float(fit.std_errors[dummy_name])
+            else:
+                se_val = float(fit.bse[dummy_name])
             pv = float(fit.pvalues[dummy_name])
             try:
                 ci = fit.conf_int()
@@ -505,21 +524,43 @@ def _extract_pt_results(fit, event_dummy_cols, periods, omit_period, chapter, pt
             pt.period_ci_lower[p] = ci_lo
             pt.period_ci_upper[p] = ci_hi
 
-            is_sig = pv < 0.10
+            # 方向判断
+            sign_ok = True
+            if expected_sign < 0 and coef > 0:
+                sign_ok = False
+            if expected_sign > 0 and coef < 0:
+                sign_ok = False
+
+            is_sig_1star = pv < 0.10
+            is_sig_2star = pv < 0.05
+
             if p < 0:
-                if is_sig:
+                if is_sig_1star:
                     n_pre_sig += 1
+                if is_sig_2star:
+                    n_pre_sig_2star += 1
             elif p > 0:
-                if is_sig:
+                # 1-star tracking
+                if is_sig_1star:
                     n_post_sig += 1
                     post_sig_consecutive += 1
                     max_post_consecutive = max(max_post_consecutive, post_sig_consecutive)
-                    if expected_sign < 0 and coef > 0:
-                        post_signs_correct = False
-                    if expected_sign > 0 and coef < 0:
+                    if not sign_ok:
                         post_signs_correct = False
                 else:
                     post_sig_consecutive = 0
+
+                # 2-star tracking (p<0.05 + 方向正确)
+                if is_sig_2star and sign_ok:
+                    n_post_sig_2star += 1
+                    post_sig_consecutive_2star += 1
+                    max_post_consecutive_2star = max(
+                        max_post_consecutive_2star, post_sig_consecutive_2star
+                    )
+                else:
+                    post_sig_consecutive_2star = 0
+                    if is_sig_2star and not sign_ok:
+                        post_signs_correct_2star = False
 
     # 基期
     pt.period_coefs[omit_period] = 0.0
@@ -528,12 +569,19 @@ def _extract_pt_results(fit, event_dummy_cols, periods, omit_period, chapter, pt
     pt.period_ci_lower[omit_period] = 0.0
     pt.period_ci_upper[omit_period] = 0.0
 
+    # 1-star stats
     pt.n_pre_sig = n_pre_sig
     pt.n_post_sig = n_post_sig
     pt.max_post_consecutive = max_post_consecutive
     pt.post_correct_sign = post_signs_correct
-    pt.success = True
 
+    # 2-star stats
+    pt.n_pre_sig_2star = n_pre_sig_2star
+    pt.n_post_sig_2star = n_post_sig_2star
+    pt.max_post_consecutive_2star = max_post_consecutive_2star
+    pt.post_correct_sign_2star = post_signs_correct_2star
+
+    pt.success = True
     return pt
 
 
