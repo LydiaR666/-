@@ -597,7 +597,8 @@ def generate_chapter_output(
     from spec_search.table_generator import (
         create_descriptive_stats_table, create_correlation_table,
         create_main_regression_table, create_psm_balance_table,
-        create_parallel_trends_table, _add_table_border,
+        create_parallel_trends_table, create_robustness_x_table,
+        save_chapter_tables,
     )
 
     doc1 = Document()
@@ -617,7 +618,49 @@ def generate_chapter_output(
     doc2.save(os.path.join(ch_dir, f"表{chapter}-2_相关系数表.docx"))
     log.info(f"  表{chapter}-2 相关系数表")
 
-    # ---- 3. PSM-DID ----
+    # ---- 3. 主回归表（多列: 逐步加入控制变量/FE）----
+    table_num = 3
+    doc3 = Document()
+
+    # 生成逐步回归: (1)仅X (2)X+Controls (3)X+Controls+FE (=best设定)
+    step_results = []
+    # 列(1): 无控制变量, 仅年份FE
+    reg_no_ctrl = run_ols_fe(
+        df_complete, best["y_var"], best_x, [],
+        [config.YEAR_VAR], best_cl,
+    )
+    if reg_no_ctrl.success:
+        step_results.append(reg_no_ctrl)
+    # 列(2): 加控制变量, 仅年份FE
+    reg_ctrl_no_fe = run_ols_fe(
+        df_complete, best["y_var"], best_x, controls,
+        [config.YEAR_VAR], best_cl,
+    )
+    if reg_ctrl_no_fe.success:
+        step_results.append(reg_ctrl_no_fe)
+    # 列(3): 完整设定 (Controls + 双向FE)
+    if main_results:
+        step_results.append(main_results[0])
+    else:
+        reg_full = run_ols_fe(
+            df_complete, best["y_var"], best_x, controls, best_fe, best_cl,
+        )
+        if reg_full.success:
+            step_results.append(reg_full)
+
+    # 追加其他Y变量的完整设定结果
+    for yv, r in sorted(y_best.items(), key=lambda x: x[1].get("score", 0), reverse=True):
+        if yv != best["y_var"] and r.get("reg_result") and len(step_results) < 6:
+            step_results.append(r["reg_result"])
+
+    create_main_regression_table(
+        doc3, step_results, "基准回归结果", chapter, table_num, controls,
+    )
+    doc3.save(os.path.join(ch_dir, f"表{chapter}-{table_num}_主回归表.docx"))
+    log.info(f"  表{chapter}-{table_num} 主回归表 ({len(step_results)} 列)")
+    table_num += 1
+
+    # ---- 4. PSM-DID ----
     psm_result = None
     try:
         psm_result = run_psm_did(
@@ -630,53 +673,44 @@ def generate_chapter_output(
     except Exception:
         pass
 
-    # ---- 3a. 主回归表 ----
-    table_num = 3
-    doc3 = Document()
     if psm_result:
-        # 匹配前基准回归
-        create_main_regression_table(
-            doc3, [psm_result.baseline_result] if psm_result.baseline_result.success else main_results,
-            "基准回归结果（全样本）", chapter, table_num, controls,
-        )
+        doc_psm = Document()
+        create_psm_balance_table(doc_psm, psm_result, "PSM平衡性检验", chapter, table_num)
+        doc_psm.save(os.path.join(ch_dir, f"表{chapter}-{table_num}_PSM平衡性.docx"))
+        log.info(f"  表{chapter}-{table_num} PSM平衡性检验")
         table_num += 1
 
-        # PSM 平衡性检验
-        create_psm_balance_table(doc3, psm_result, "PSM平衡性检验", chapter, table_num)
-        table_num += 1
-
-        # 匹配后回归
-        create_main_regression_table(
-            doc3, [psm_result.psm_result] if psm_result.psm_result.success else [],
-            "PSM-DID回归结果（匹配后）", chapter, table_num, controls,
-        )
-        table_num += 1
-    else:
-        # 多列主回归表（每列一个Y）
-        create_main_regression_table(
-            doc3, main_results, "基准回归结果", chapter, table_num, controls,
-        )
-        table_num += 1
-
-    doc3.save(os.path.join(ch_dir, f"表{chapter}-3_主回归表.docx"))
-    log.info(f"  表{chapter}-3 主回归表 ({len(main_results)} 列)")
-
-    # ---- 4. 稳健性检验表（替代X变量）----
-    rob_results_x = [r for r in all_results if r.get("is_robustness_x", False)]
-    if rob_results_x:
-        rob_reg_results = [r.get("reg_result") for r in rob_results_x
-                           if r.get("reg_result") and r["reg_result"].success]
-        if rob_reg_results:
-            doc_rob = Document()
+        # PSM-DID 回归
+        psm_regs = []
+        if psm_result.baseline_result.success:
+            psm_regs.append(psm_result.baseline_result)
+        if psm_result.psm_result.success:
+            psm_regs.append(psm_result.psm_result)
+        if psm_regs:
+            doc_psm_reg = Document()
             create_main_regression_table(
-                doc_rob, rob_reg_results[:6],
-                "稳健性检验：替代解释变量", chapter, table_num, controls,
+                doc_psm_reg, psm_regs,
+                "PSM-DID回归结果", chapter, table_num, controls,
             )
-            doc_rob.save(os.path.join(ch_dir, f"表{chapter}-{table_num}_稳健性替代X.docx"))
-            log.info(f"  表{chapter}-{table_num} 稳健性替代X ({len(rob_reg_results[:6])} 列)")
+            doc_psm_reg.save(os.path.join(ch_dir, f"表{chapter}-{table_num}_PSM-DID回归.docx"))
+            log.info(f"  表{chapter}-{table_num} PSM-DID回归")
             table_num += 1
 
-    # ---- 5. 平行趋势检验表 ----
+    # ---- 稳健性检验表（替代X变量）----
+    rob_results_x = [r for r in all_results if r.get("is_robustness_x", False)]
+    rob_reg_results = [r.get("reg_result") for r in rob_results_x
+                       if r.get("reg_result") and r["reg_result"].success]
+    if rob_reg_results:
+        doc_rob = Document()
+        create_robustness_x_table(
+            doc_rob, rob_reg_results[:6],
+            "稳健性检验：替代解释变量", chapter, table_num, controls,
+        )
+        doc_rob.save(os.path.join(ch_dir, f"表{chapter}-{table_num}_稳健性替代X.docx"))
+        log.info(f"  表{chapter}-{table_num} 稳健性替代X ({len(rob_reg_results[:6])} 列)")
+        table_num += 1
+
+    # ---- 平行趋势检验表 ----
     pt_results = []
     pt_result = best.get("pt_result")
     if pt_result is None:
@@ -706,13 +740,13 @@ def generate_chapter_output(
         log.info(f"  表{chapter}-{table_num} 平行趋势表 ({len(pt_results)} 列)")
         table_num += 1
 
-    # ---- 6-7. 动态效应图 ----
+    # ---- 动态效应图 ----
     for pt in pt_results:
         if pt.success:
             plot_dynamic_effects(
                 pt,
                 output_path=os.path.join(ch_dir, f"图{chapter}_动态效应_{pt.y_var}.png"),
-                title=f"Ch.{chapter} Dynamic Effects: {pt.y_var}",
+                title=f"图{chapter}  动态效应: {pt.y_var}",
                 chapter=chapter,
                 y_label=pt.y_var,
             )
@@ -721,20 +755,21 @@ def generate_chapter_output(
         plot_multiple_dynamic_effects(
             pt_results,
             output_path=os.path.join(ch_dir, f"图{chapter}_动态效应对比.png"),
-            title=f"第{chapter}章 动态效应对比",
+            title=f"图{chapter}  动态效应对比",
             chapter=chapter,
         )
 
-    # 也保存合并版
+    # 保存合并版
     save_chapter_tables(
         chapter=chapter,
         desc_stats=desc_stats,
         corr_matrix=corr_matrix,
-        main_results=main_results,
+        main_results=step_results,
         psm_result=psm_result,
         pt_results=pt_results,
         controls_list=controls,
         output_dir=ch_dir,
+        robustness_results=rob_reg_results[:6] if rob_reg_results else None,
     )
 
 
@@ -923,7 +958,11 @@ def save_search_log(state: SearchState, output_dir: str):
 
 
 def generate_stata_code(state: SearchState, output_dir: str):
-    """为各章生成等价的 Stata .do 文件。"""
+    """
+    为各章生成完整、可直接运行的 Stata .do 文件。
+    包含: 数据加载→样本筛选→缩尾→Listwise Deletion→面板设定→
+          描述统计→相关系数→逐步回归→PSM-DID→平行趋势→动态效应图→esttab输出
+    """
     for chapter in [3, 4, 5]:
         best = state.best_specs.get(chapter)
         if not best:
@@ -945,197 +984,297 @@ def generate_stata_code(state: SearchState, output_dir: str):
         pt_base = best.get("pt_base_period", "pre1")
 
         ctrl_str = " ".join(ctrls)
-        absorb_str = " ".join(fe) if fe else "Year"
-        cluster_str = cl[0] if cl else "Stkcd"
+        firm = config.FIRM_ID
+        year = config.YEAR_VAR
+        absorb_str = " ".join(fe) if fe else year
+        cluster_str = cl[0] if cl else firm
 
         omit_val = {"pre1": -1, "pre0": 0, "pre_biggest": pt_pre}.get(pt_base, -1)
-        omit_label = {"pre1": "pre1", "pre0": "current",
-                      "pre_biggest": f"pre{abs(pt_pre)}"}.get(pt_base, "pre1")
 
-        code_lines = [
-            f"/*",
-            f"{'=' * 60}",
-            f"第{chapter}章 回归代码 — 自动生成 by Specification Search",
-            f"{'=' * 60}",
-            f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-            f"Y: {y}  |  X: {x}",
-            f"Controls: {ctrl_str}",
-            f"FE: {' + '.join(fe)}  |  Cluster: {' + '.join(cl)}",
-            f"Sample: {sy}-{ey}",
-            f"Coef={best.get('coef', 'NA'):.4f}, p={best.get('pval', 'NA'):.4f}{best.get('stars', '')}",
-            f"{'=' * 60}",
-            f"*/",
-            f"",
-            f"clear all",
-            f"set more off",
-            f"set matsize 10000",
-            f"",
-            f'* {"=" * 50}',
-            f"* 1. 数据加载",
-            f'* {"=" * 50}',
-            f'use "{config.DATA_PATH}", clear',
-            f"",
-            f'* {"=" * 50}',
-            f"* 2. 样本筛选",
-            f'* {"=" * 50}',
-            f"keep if {config.YEAR_VAR} >= {sy} & {config.YEAR_VAR} <= {ey}",
-        ]
+        L = []  # code lines
+        a = L.append
+
+        # =========== 文件头 ===========
+        a(f"/*")
+        a(f"{'=' * 64}")
+        a(f"  第{chapter}章 完整回归代码")
+        a(f"  自动生成 by Specification Search Engine")
+        a(f"  生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        a(f"{'─' * 64}")
+        a(f"  Y (被解释变量):  {y}")
+        a(f"  X (解释变量):    {x}")
+        a(f"  Controls:        {ctrl_str}")
+        a(f"  FE:              {' + '.join(fe)}")
+        a(f"  Cluster:         {' + '.join(cl)}")
+        a(f"  Sample:          {sy}-{ey}")
+        a(f"  Python结果:      coef={best.get('coef', 0):.4f}, "
+          f"p={best.get('pval', 1):.4f}{best.get('stars', '')}, "
+          f"N={best.get('nobs', 0)}")
+        a(f"{'=' * 64}")
+        a(f"*/")
+        a("")
+
+        # =========== 0. 环境准备 ===========
+        a("clear all")
+        a("set more off")
+        a("set matsize 11000")
+        a("")
+        a("* --- 安装所需命令（首次运行取消注释）---")
+        a("* ssc install reghdfe, replace")
+        a("* ssc install ftools, replace")
+        a("* ssc install psmatch2, replace")
+        a("* ssc install estout, replace")
+        a("* ssc install winsor2, replace")
+        a("* ssc install coefplot, replace")
+        a("")
+
+        # =========== 1. 数据加载 ===========
+        a(f'{"*" * 60}')
+        a(f"* 1. 数据加载")
+        a(f'{"*" * 60}')
+        a(f'use "{config.DATA_PATH}", clear')
+        a("")
+
+        # =========== 2. 样本筛选 ===========
+        a(f'{"*" * 60}')
+        a(f"* 2. 样本筛选")
+        a(f'{"*" * 60}')
+        a(f"keep if {year} >= {sy} & {year} <= {ey}")
 
         if filt.get("drop_st_pt"):
-            code_lines += [
-                "",
-                "* 剔除 ST/PT",
-                "capture confirm variable ST",
-                'if !_rc drop if ST == 1',
-                "capture confirm variable Stkname",
-                'if !_rc drop if regexm(Stkname, \"ST|PT|\\*ST\")',
-            ]
+            a("")
+            a("* 剔除 ST/PT 股票")
+            a("capture confirm variable ST")
+            a("if !_rc drop if ST == 1")
+            a("capture confirm variable Stkname")
+            a('if !_rc drop if regexm(Stkname, "ST|PT|\\*ST")')
 
         if filt.get("drop_finance"):
-            code_lines += [
-                "",
-                "* 剔除金融行业",
-                "capture confirm variable Ind",
-                'if !_rc drop if substr(Ind, 1, 1) == "J"',
-            ]
+            a("")
+            a("* 剔除金融行业 (证监会行业代码J)")
+            a("capture confirm variable Ind")
+            a('if !_rc drop if substr(Ind, 1, 1) == "J"')
 
         if filt.get("drop_real_estate"):
-            code_lines += [
-                "",
-                "* 剔除房地产行业",
-                "capture confirm variable Ind",
-                'if !_rc drop if substr(Ind, 1, 1) == "K"',
-            ]
+            a("")
+            a("* 剔除房地产行业 (证监会行业代码K)")
+            a("capture confirm variable Ind")
+            a('if !_rc drop if substr(Ind, 1, 1) == "K"')
 
         if filt.get("drop_lev_gt1"):
-            code_lines += [
-                "",
-                "* 剔除 Lev > 1",
-                "drop if Lev > 1 & Lev != .",
-            ]
+            a("")
+            a("* 剔除资产负债率>1的异常值")
+            a("drop if Lev > 1 & Lev != .")
 
         if filt.get("drop_ind_lt30"):
-            code_lines += [
-                "",
-                "* 剔除行业观测 < 30",
-                "bysort Ind: gen _ind_n = _N",
-                "drop if _ind_n < 30",
-                "drop _ind_n",
-            ]
+            a("")
+            a("* 剔除行业年度观测量<30的行业")
+            a("bysort Ind: gen _ind_n = _N")
+            a("drop if _ind_n < 30")
+            a("drop _ind_n")
 
+        # =========== 3. 缩尾处理 ===========
         winsorize = filt.get("winsorize")
         if winsorize:
             pct = int(winsorize * 100)
-            code_lines += [
-                "",
-                f"* 连续变量缩尾 ({pct}%)",
-                f"foreach var of varlist {y} {ctrl_str} {{",
-                f"    capture winsor2 `var', replace cuts({pct} {100 - pct})",
-                f"}}",
-            ]
+            a("")
+            a(f'{"*" * 60}')
+            a(f"* 3. 连续变量缩尾处理 ({pct}%/{100 - pct}%)")
+            a(f'{"*" * 60}')
+            a(f"foreach var of varlist {y} {ctrl_str} {{")
+            a(f"    capture winsor2 `var', replace cuts({pct} {100 - pct})")
+            a(f"}}")
+        a("")
 
-        code_lines += [
-            "",
-            f'* {"=" * 50}',
-            f"* 3. 样本一致性 (listwise deletion)",
-            f'* {"=" * 50}',
-            f"drop if missing({y})",
-            f"drop if missing({x})",
-            f"foreach var of varlist {ctrl_str} {{",
-            f"    drop if missing(`var')",
-            f"}}",
-            "",
-            f'* {"=" * 50}',
-            f"* 4. 描述统计",
-            f'* {"=" * 50}',
-            f"summarize {x} {y} {ctrl_str}, detail",
-            "",
-            f'* {"=" * 50}',
-            f"* 5. 相关系数矩阵",
-            f'* {"=" * 50}',
-            f"pwcorr {x} {y} {ctrl_str}, star(0.05)",
-            "",
-            f'* {"=" * 50}',
-            f"* 6. 主回归 (reghdfe)",
-            f'* {"=" * 50}',
-            f"* ssc install reghdfe",
-            f"reghdfe {y} {x} {ctrl_str}, absorb({absorb_str}) vce(cluster {cluster_str})",
-            f"est store main_reg",
-            "",
-            f'* {"=" * 50}',
-            f"* 7. PSM-DID",
-            f'* {"=" * 50}',
-            f"* ssc install psmatch2",
-            f"bysort {config.FIRM_ID}: egen _ever_treated = max({x})",
-            f"logit _ever_treated {ctrl_str}",
-            f"predict _pscore, pr",
-            f"psmatch2 _ever_treated, pscore(_pscore) neighbor(1) caliper(0.05)",
-            f"pstest {ctrl_str}, both",
-            f"reghdfe {y} {x} {ctrl_str} if _weight != ., absorb({absorb_str}) vce(cluster {cluster_str})",
-            f"est store psm_reg",
-            "",
-            f'* {"=" * 50}',
-            f"* 8. 平行趋势检验 (事件研究法)",
-            f'* {"=" * 50}',
-            f"* 生成事件时间变量",
-            f"capture drop _first_treat_year event_year event_time",
-            f"bysort {config.FIRM_ID}: egen _first_treat_year = min({config.YEAR_VAR}) if {x} == 1",
-            f"bysort {config.FIRM_ID}: egen event_year = min(_first_treat_year)",
-            f"gen event_time = {config.YEAR_VAR} - event_year",
-            f"drop _first_treat_year",
-            "",
-            f"* 事件时间哑变量 (基期: {omit_label})",
-        ]
+        # =========== 4. Listwise Deletion ===========
+        a(f'{"*" * 60}')
+        a(f"* 4. Listwise Deletion (保证各表N一致)")
+        a(f'{"*" * 60}')
+        a(f"* 标记缺失观测")
+        a(f"gen _keep = 1")
+        all_vars_str = f"{y} {x} {ctrl_str}"
+        a(f"foreach var of varlist {all_vars_str} {{")
+        a(f"    replace _keep = 0 if missing(`var')")
+        a(f"}}")
+        a(f"keep if _keep == 1")
+        a(f"drop _keep")
+        a(f'di "样本量 N = " _N')
+        a("")
+
+        # =========== 5. 面板设定 ===========
+        a(f'{"*" * 60}')
+        a(f"* 5. 面板设定")
+        a(f'{"*" * 60}')
+        a(f"destring {firm}, replace force")
+        a(f"xtset {firm} {year}")
+        a("")
+
+        # =========== 6. 描述统计 ===========
+        a(f'{"*" * 60}')
+        a(f"* 6. 描述统计 (表{chapter}-1)")
+        a(f'{"*" * 60}')
+        a(f"summarize {x} {y} {ctrl_str}, detail")
+        a(f'estpost summarize {x} {y} {ctrl_str}, detail')
+        a(f'esttab using "表{chapter}-1_描述统计.rtf", ///'.rstrip())
+        a(f'    cells("count mean sd min p25 p50 p75 max") ///'.rstrip())
+        a(f"    replace noobs label ///")
+        a(f'    title("表{chapter}-1 主要变量描述统计")')
+        a("")
+
+        # =========== 7. 相关系数矩阵 ===========
+        a(f'{"*" * 60}')
+        a(f"* 7. 相关系数矩阵 (表{chapter}-2)")
+        a(f'{"*" * 60}')
+        a(f"pwcorr {x} {y} {ctrl_str}, star(0.05) sig")
+        a("")
+
+        # =========== 8. 逐步回归 (表X-3) ===========
+        a(f'{"*" * 60}')
+        a(f"* 8. 主回归 — 逐步加入控制变量 (表{chapter}-3)")
+        a(f'{"*" * 60}')
+        a("")
+        a(f"* 列(1): 仅X, 年份FE")
+        a(f"reghdfe {y} {x}, absorb({year}) vce(cluster {cluster_str})")
+        a(f"est store m1")
+        a("")
+        a(f"* 列(2): X + Controls, 年份FE")
+        a(f"reghdfe {y} {x} {ctrl_str}, absorb({year}) vce(cluster {cluster_str})")
+        a(f"est store m2")
+        a("")
+        a(f"* 列(3): X + Controls, 完整FE ({' + '.join(fe)})")
+        a(f"reghdfe {y} {x} {ctrl_str}, absorb({absorb_str}) vce(cluster {cluster_str})")
+        a(f"est store m3")
+        a("")
+        a(f"* 输出逐步回归表")
+        a(f'esttab m1 m2 m3 using "表{chapter}-3_主回归.rtf", ///'.rstrip())
+        a(f"    replace ///")
+        a(f"    star(* 0.10 ** 0.05 *** 0.01) ///")
+        a(f"    b(%9.4f) se(%9.4f) ///")
+        a(f'    stats(N r2_a, labels("N" "Adj. R-sq") fmt(%9.0fc %9.4f)) ///'.rstrip())
+        a(f'    title("表{chapter}-3 基准回归结果") ///'.rstrip())
+        a(f'    mtitles("(1)" "(2)" "(3)") ///'.rstrip())
+        a(f'    note("括号内为聚类稳健标准误（聚类至{cluster_str}层面）。*** p<0.01, ** p<0.05, * p<0.10")')
+        a("")
+
+        # =========== 9. PSM-DID ===========
+        a(f'{"*" * 60}')
+        a(f"* 9. PSM-DID (表{chapter}-4, 表{chapter}-5)")
+        a(f'{"*" * 60}')
+        a("")
+        a(f"* 9a. 生成企业层面处理标识")
+        a(f"capture drop _ever_treated")
+        a(f"bysort {firm}: egen _ever_treated = max({x})")
+        a("")
+        a(f"* 9b. Logit 倾向得分估计")
+        a(f"logit _ever_treated {ctrl_str}")
+        a(f"predict _pscore, pr")
+        a("")
+        a(f"* 9c. 最近邻匹配 (1:1, caliper=0.05)")
+        a(f"psmatch2 _ever_treated, pscore(_pscore) neighbor(1) caliper(0.05)")
+        a("")
+        a(f"* 9d. 平衡性检验 (表{chapter}-4)")
+        a(f"pstest {ctrl_str}, both")
+        a("")
+        a(f"* 9e. 匹配后回归")
+        a(f"reghdfe {y} {x} {ctrl_str} if _weight != ., ///")
+        a(f"    absorb({absorb_str}) vce(cluster {cluster_str})")
+        a(f"est store psm_reg")
+        a("")
+        a(f"* 9f. 全样本 vs 匹配后对比 (表{chapter}-5)")
+        a(f'esttab m3 psm_reg using "表{chapter}-5_PSM-DID.rtf", ///'.rstrip())
+        a(f"    replace ///")
+        a(f"    star(* 0.10 ** 0.05 *** 0.01) ///")
+        a(f"    b(%9.4f) se(%9.4f) ///")
+        a(f'    stats(N r2_a, labels("N" "Adj. R-sq") fmt(%9.0fc %9.4f)) ///'.rstrip())
+        a(f'    title("表{chapter}-5 PSM-DID回归结果") ///'.rstrip())
+        a(f'    mtitles("全样本" "匹配后") ///'.rstrip())
+        a(f'    note("括号内为聚类稳健标准误。*** p<0.01, ** p<0.05, * p<0.10")')
+        a("")
+
+        # =========== 10. 平行趋势检验 ===========
+        a(f'{"*" * 60}')
+        a(f"* 10. 平行趋势检验 / 事件研究法 (表{chapter}-6)")
+        a(f'{"*" * 60}')
+        a("")
+        a(f"* 10a. 生成事件时间变量")
+        a(f"capture drop _first_treat event_year event_time treated_ever")
+        a(f"bysort {firm}: egen _first_treat = min({year}) if {x} == 1")
+        a(f"bysort {firm}: egen event_year = min(_first_treat)")
+        a(f"gen event_time = {year} - event_year")
+        a(f"gen treated_ever = !missing(event_year)")
+        a(f"drop _first_treat")
+        a("")
+        a(f"* 10b. 生成事件时间哑变量 (基期: t={omit_val})")
 
         dummies = []
         for p in range(pt_pre, pt_post + 1):
             if p == omit_val:
+                a(f"* t={p}: 基期（省略）")
                 continue
             name = f"pre{abs(p)}" if p < 0 else ("current" if p == 0 else f"post{p}")
             dummies.append(name)
-            code_lines.append(
-                f"gen {name} = (event_time == {p}) & !missing(event_year)"
-            )
+            a(f"gen {name} = (event_time == {p}) & treated_ever == 1")
 
         dummies_str = " ".join(dummies)
-        code_lines += [
-            "",
-            f"reghdfe {y} {dummies_str} {ctrl_str}, absorb({absorb_str}) vce(cluster {cluster_str})",
-            f"est store pt_reg",
-            "",
-            f'* {"=" * 50}',
-            f"* 9. 动态效应图",
-            f'* {"=" * 50}',
-            f"* ssc install coefplot",
-            f"coefplot, keep({dummies_str}) ///",
-            f"    vertical ///",
-            f"    yline(0, lpattern(dash) lcolor(black)) ///",
-            f"    ylabel(, angle(horizontal)) ///",
-            f'    title("第{chapter}章 动态效应图") ///',
-            f'    xtitle("Event Time") ytitle("Coefficient") ///',
-            f"    msymbol(O) mcolor(navy) ///",
-            f"    ciopts(lcolor(navy) lwidth(thin)) ///",
-            f"    graphregion(color(white)) bgcolor(white)",
-            f'graph export "动态效应图_{y}.png", replace width(1200)',
-            "",
-            f'* {"=" * 50}',
-            f"* 10. 输出回归表",
-            f'* {"=" * 50}',
-            f"* ssc install esttab",
-            f'esttab main_reg psm_reg pt_reg using "第{chapter}章_回归结果.rtf", ///',
-            f"    replace ///",
-            f"    star(* 0.10 ** 0.05 *** 0.01) ///",
-            f"    b(%9.4f) se(%9.4f) ///",
-            f'    stats(N r2_a, labels("N" "Adj. R²") fmt(%9.0fc %9.4f)) ///',
-            f'    title("第{chapter}章 回归结果") ///',
-            f'    mtitles("Baseline" "PSM-DID" "Parallel Trends") ///',
-            f'    note("聚类稳健标准误; *** p<0.01, ** p<0.05, * p<0.10")',
-            "",
-            f"* End of Chapter {chapter}",
-        ]
+        a("")
+        a(f"* 10c. 事件研究回归")
+        a(f"reghdfe {y} {dummies_str} {ctrl_str}, ///")
+        a(f"    absorb({absorb_str}) vce(cluster {cluster_str})")
+        a(f"est store pt_reg")
+        a("")
+
+        a(f"* 10d. 输出平行趋势表")
+        a(f'esttab pt_reg using "表{chapter}-6_平行趋势.rtf", ///'.rstrip())
+        a(f"    replace ///")
+        a(f"    keep({dummies_str}) ///")
+        a(f"    star(* 0.10 ** 0.05 *** 0.01) ///")
+        a(f"    b(%9.4f) se(%9.4f) ///")
+        a(f'    stats(N r2_a, labels("N" "Adj. R-sq") fmt(%9.0fc %9.4f)) ///'.rstrip())
+        a(f'    title("表{chapter}-6 平行趋势检验") ///'.rstrip())
+        a(f'    note("基期: t={omit_val}（系数为0）。括号内为聚类稳健标准误。")')
+        a("")
+
+        # =========== 11. 动态效应图 ===========
+        a(f'{"*" * 60}')
+        a(f"* 11. 动态效应图 (图{chapter})")
+        a(f'{"*" * 60}')
+        a("")
+        a(f"coefplot pt_reg, ///")
+        a(f"    keep({dummies_str}) ///")
+        a(f"    vertical ///")
+        a(f"    yline(0, lpattern(dash) lcolor(black) lwidth(thin)) ///")
+        a(f"    xline({abs(omit_val) + 0.5 if omit_val < 0 else 0.5}, lpattern(dash) lcolor(red) lwidth(thin)) ///")
+        a(f"    ylabel(, angle(horizontal) labsize(small)) ///")
+        a(f"    xlabel(, labsize(small)) ///")
+        a(f'    title("图{chapter} 动态效应", size(medium)) ///'.rstrip())
+        a(f'    xtitle("事件时间（相对于处理时点）", size(small)) ///'.rstrip())
+        a(f'    ytitle("回归系数", size(small)) ///'.rstrip())
+        a(f"    msymbol(O) mcolor(navy) msize(medium) ///")
+        a(f"    ciopts(lcolor(navy%60) lwidth(thin)) ///")
+        a(f"    graphregion(color(white)) bgcolor(white) ///")
+        a(f"    plotregion(margin(small))")
+        a(f'graph export "图{chapter}_动态效应_{y}.png", replace width(1500)')
+        a("")
+
+        # =========== 12. 完整输出表 ===========
+        a(f'{"*" * 60}')
+        a(f"* 12. 完整回归结果汇总 (表{chapter})")
+        a(f'{"*" * 60}')
+        a("")
+        a(f'esttab m1 m2 m3 psm_reg pt_reg ///'.rstrip())
+        a(f'    using "第{chapter}章_回归结果汇总.rtf", ///'.rstrip())
+        a(f"    replace ///")
+        a(f"    star(* 0.10 ** 0.05 *** 0.01) ///")
+        a(f"    b(%9.4f) se(%9.4f) ///")
+        a(f'    stats(N r2_a, labels("N" "Adj. R-sq") fmt(%9.0fc %9.4f)) ///'.rstrip())
+        a(f'    title("第{chapter}章 回归结果汇总") ///'.rstrip())
+        a(f'    mtitles("仅X" "加Controls" "基准" "PSM-DID" "平行趋势") ///'.rstrip())
+        a(f'    note("括号内为聚类稳健标准误（聚类至{cluster_str}层面）。*** p<0.01, ** p<0.05, * p<0.10")')
+        a("")
+        a(f"* === 第{chapter}章完毕 ===")
 
         with open(do_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(code_lines))
+            f.write("\n".join(L))
 
         log.info(f"  Stata代码: {do_path}")
 
