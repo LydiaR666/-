@@ -215,7 +215,10 @@ def _run_panel_ols(
         fit = mod.fit(cov_type="clustered", cluster_entity=True, cluster_time=True)
     elif len(cluster_vars) >= 1 and cluster_vars[0] == firm_col:
         fit = mod.fit(cov_type="clustered", cluster_entity=True)
+    elif len(cluster_vars) >= 1 and cluster_vars[0] == year_col:
+        fit = mod.fit(cov_type="clustered", cluster_time=True)
     else:
+        # PanelOLS 不支持任意变量聚类, 降级到企业聚类
         fit = mod.fit(cov_type="clustered", cluster_entity=True)
 
     if x_var not in fit.params.index:
@@ -625,6 +628,12 @@ def run_psm_did(
         psm.baseline_result = run_ols_fe(df, y_var, x_var, controls, fe_vars, cluster_vars)
 
         if x_var not in df.columns:
+            return psm
+
+        # PSM 仅适用于二值处理变量
+        x_unique = df[x_var].dropna().unique()
+        if not set(x_unique).issubset({0, 0.0, 1, 1.0}):
+            psm.baseline_result.error_msg = f"PSM 需要二值X变量, {x_var} 有 {len(x_unique)} 个取值"
             return psm
 
         # 企业层面处理标识

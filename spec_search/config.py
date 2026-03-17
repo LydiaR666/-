@@ -179,7 +179,6 @@ PSM_METHODS = [
     {"method": "nearest", "n_neighbors": 1, "caliper": None},
     {"method": "nearest", "n_neighbors": 4, "caliper": None},
     {"method": "nearest", "n_neighbors": 1, "caliper": 0.05},
-    {"method": "kernel", "n_neighbors": None, "caliper": None},
 ]
 
 # ============================================================

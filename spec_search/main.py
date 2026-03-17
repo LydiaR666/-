@@ -363,11 +363,15 @@ def run_chapter_search(
         if pt_score > float("-inf"):
             # PT 通过: 事后≥2期连续≥2星显著 + 方向正确
             # 在 candidates 中查找匹配的主回归结果
+            spec_fe_key = "+".join(sorted(spec.fe_vars))
+            spec_cl_key = "+".join(sorted(spec.cluster_vars))
             matching = [r for r in (all_qualified + relaxed_candidates)
                         if r["y_var"] == spec.y_var and r["x_var"] == spec.x_var
                         and r.get("start_year") == spec.start_year
                         and r.get("end_year") == spec.end_year
-                        and r.get("controls_group") == spec.controls_group]
+                        and r.get("controls_group") == spec.controls_group
+                        and "+".join(sorted(r.get("fe_vars", []))) == spec_fe_key
+                        and "+".join(sorted(r.get("cluster_vars", []))) == spec_cl_key]
 
             if matching:
                 best_match = max(matching, key=lambda r: r.get("score", float("-inf")))
@@ -991,14 +995,16 @@ def generate_stata_code(state: SearchState, output_dir: str):
             code_lines += [
                 "",
                 "* 剔除金融行业",
-                'capture drop if substr(Ind, 1, 1) == "J"',
+                "capture confirm variable Ind",
+                'if !_rc drop if substr(Ind, 1, 1) == "J"',
             ]
 
         if filt.get("drop_real_estate"):
             code_lines += [
                 "",
                 "* 剔除房地产行业",
-                'capture drop if substr(Ind, 1, 1) == "K"',
+                "capture confirm variable Ind",
+                'if !_rc drop if substr(Ind, 1, 1) == "K"',
             ]
 
         if filt.get("drop_lev_gt1"):
