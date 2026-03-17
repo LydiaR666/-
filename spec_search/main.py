@@ -6,11 +6,9 @@
   1. 各章 X 一致、章内样本量一致
   2. 主回归至少二星显著 + 方向正确
   3. 平行趋势: 事前 ≤1 期显著, 事后 ≥2 期连续显著
-============================================================
+
 用法:
     python -m spec_search.main
-    或
-    python spec_search/main.py
 ============================================================
 """
 
@@ -19,6 +17,7 @@ import sys
 import json
 import time
 import warnings
+import logging
 from collections import defaultdict
 from datetime import datetime
 
@@ -27,13 +26,12 @@ import pandas as pd
 
 warnings.filterwarnings("ignore")
 
-# 确保可以 import spec_search
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from spec_search import config
 from spec_search.data_loader import (
     load_data, apply_sample_filters, winsorize_variables,
-    generate_event_time, get_continuous_vars, prepare_panel_data,
+    generate_event_time, get_continuous_vars, set_verbose,
 )
 from spec_search.regression_engine import (
     run_ols_fe, run_parallel_trends, run_psm_did,
@@ -46,8 +44,7 @@ from spec_search.specification_grid import (
 )
 from spec_search.evaluator import (
     evaluate_regression, evaluate_parallel_trends,
-    evaluate_specification_full, check_cross_chapter_consistency,
-    check_sign, check_significance,
+    check_cross_chapter_consistency, check_sign, check_significance,
 )
 from spec_search.table_generator import save_chapter_tables
 from spec_search.figure_generator import (
@@ -56,57 +53,51 @@ from spec_search.figure_generator import (
 
 
 # ============================================================
-# 全局状态
+# 日志配置
 # ============================================================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("spec_search")
+
+
 class SearchState:
-    """搜索状态跟踪"""
+    """搜索状态"""
     def __init__(self):
         self.raw_df = None
         self.chapter_results = {3: [], 4: [], 5: []}
         self.best_specs = {3: None, 4: None, 5: None}
-        self.search_log = []
         self.start_time = time.time()
 
     def elapsed(self):
-        return f"{time.time() - self.start_time:.1f}s"
+        return f"{time.time() - self.start_time:.0f}s"
 
 
 def main():
-    """主入口：执行完整的回归设定搜索流程。"""
+    """主入口。"""
     print("=" * 70)
-    print("  回归设定搜索（Specification Search）")
-    print("  数字并购与企业内部利益相关者价值效应")
+    print("  Specification Search — 数字并购与利益相关者价值效应")
     print("=" * 70)
-    print(f"  开始时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"  数据路径: {config.DATA_PATH}")
+    print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"  数据: {config.DATA_PATH}")
     print("=" * 70)
 
     state = SearchState()
 
-    # ============================================================
-    # Step 1: 加载数据
-    # ============================================================
-    print("\n" + "=" * 50)
-    print("Step 1: 加载数据")
-    print("=" * 50)
-
+    # ========== Step 1: 加载数据 ==========
+    log.info("Step 1: 加载数据")
     state.raw_df = load_data()
-
-    # 打印变量信息
-    cols = state.raw_df.columns.tolist()
-    print(f"\n总变量数: {len(cols)}")
-    print(f"总样本量: {len(state.raw_df)}")
-
-    # 检查关键变量
     _print_variable_availability(state.raw_df)
 
-    # ============================================================
-    # Step 2: 逐章搜索
-    # ============================================================
+    # ========== Step 2: 逐章搜索 ==========
+    # 关闭筛选函数的逐条打印
+    set_verbose(False)
+
     for chapter in [3, 4, 5]:
-        print(f"\n{'=' * 70}")
-        print(f"  第{chapter}章 搜索开始 [{state.elapsed()}]")
-        print(f"{'=' * 70}")
+        log.info(f"=" * 50)
+        log.info(f"第{chapter}章搜索开始 [{state.elapsed()}]")
 
         is_ch5 = (chapter == 5)
         results = run_chapter_search(state.raw_df, chapter, is_ch5_robustness=is_ch5)
@@ -115,33 +106,34 @@ def main():
         if results:
             best = max(results, key=lambda r: r.get("score", float("-inf")))
             state.best_specs[chapter] = best
-            print(f"\n  [第{chapter}章最优] X={best['x_var']}, Y={best['y_var']}, "
-                  f"coef={best.get('coef', 'N/A')}, p={best.get('pval', 'N/A')}, "
-                  f"score={best.get('score', 'N/A'):.1f}")
+            log.info(
+                f"第{chapter}章最优: X={best['x_var']}, Y={best['y_var']}, "
+                f"coef={best.get('coef', 'NA'):.4f}, "
+                f"p={best.get('pval', 'NA'):.4f}{best.get('stars', '')}, "
+                f"N={best.get('nobs', 0)}, score={best.get('score', 0):.1f}"
+            )
         else:
-            print(f"\n  [第{chapter}章] 未找到满足约束的设定")
+            log.warning(f"第{chapter}章: 未找到满足约束的设定")
 
-    # ============================================================
-    # Step 3: 跨章节一致性检验
-    # ============================================================
-    print(f"\n{'=' * 70}")
-    print(f"  跨章节一致性检验 [{state.elapsed()}]")
-    print(f"{'=' * 70}")
+    set_verbose(True)
+
+    # ========== Step 3: 跨章一致性 ==========
+    log.info("=" * 50)
+    log.info(f"跨章节一致性检验 [{state.elapsed()}]")
 
     cross_results = check_cross_chapter_consistency(
         state.chapter_results[3],
         state.chapter_results[4],
-        state.chapter_results[5] if state.chapter_results[5] else None,
+        state.chapter_results[5] or None,
     )
 
     if cross_results:
         best_cross = cross_results[0]
-        print(f"\n  最优跨章节设定:")
-        print(f"    X变量: {best_cross.x_var}")
-        print(f"    样本区间: {best_cross.start_year}-{best_cross.end_year}")
-        print(f"    总分: {best_cross.total_score:.1f}")
-
-        # 更新各章最优为一致的设定
+        log.info(
+            f"最优跨章设定: X={best_cross.x_var}, "
+            f"区间={best_cross.start_year}-{best_cross.end_year}, "
+            f"总分={best_cross.total_score:.1f}"
+        )
         if best_cross.ch3_best:
             state.best_specs[3] = best_cross.ch3_best
         if best_cross.ch4_best:
@@ -149,14 +141,11 @@ def main():
         if best_cross.ch5_best:
             state.best_specs[5] = best_cross.ch5_best
     else:
-        print("  未找到跨章节一致设定，使用各章独立最优")
+        log.info("未找到跨章一致设定，使用各章独立最优")
 
-    # ============================================================
-    # Step 4: 生成输出
-    # ============================================================
-    print(f"\n{'=' * 70}")
-    print(f"  生成输出文件 [{state.elapsed()}]")
-    print(f"{'=' * 70}")
+    # ========== Step 4: 生成输出 ==========
+    log.info("=" * 50)
+    log.info(f"生成输出文件 [{state.elapsed()}]")
 
     output_dir = os.path.abspath(config.OUTPUT_DIR)
     os.makedirs(output_dir, exist_ok=True)
@@ -164,45 +153,49 @@ def main():
     for chapter in [3, 4, 5]:
         if state.best_specs[chapter]:
             generate_chapter_output(
-                state.raw_df, state.best_specs[chapter], chapter, output_dir
+                state.raw_df, state.best_specs[chapter],
+                state.chapter_results[chapter], chapter, output_dir,
             )
         else:
-            print(f"  第{chapter}章: 无最优设定，跳过输出")
+            log.warning(f"第{chapter}章: 无最优设定，跳过输出")
 
-    # 保存搜索日志
     save_search_log(state, output_dir)
-
-    # 生成 Stata 代码
     generate_stata_code(state, output_dir)
 
-    print(f"\n{'=' * 70}")
-    print(f"  搜索完成！总耗时: {state.elapsed()}")
-    print(f"  输出目录: {output_dir}")
-    print(f"{'=' * 70}")
+    log.info("=" * 50)
+    log.info(f"完成！耗时: {state.elapsed()}")
+    log.info(f"输出目录: {output_dir}")
 
 
 def _print_variable_availability(df: pd.DataFrame):
     """打印关键变量可用性。"""
     cols = set(df.columns)
 
-    print("\n--- 解释变量可用性 ---")
+    print("\n--- 解释变量 ---")
     for x in config.X_VARS_PRIMARY:
-        status = "✓" if x in cols else "✗"
         if x in cols:
-            n_nonmiss = df[x].notna().sum()
-            n_ones = (df[x] == 1).sum() if df[x].dtype in [float, int, np.float64, np.int64] else "?"
-            print(f"  {status} {x}: N={n_nonmiss}, treated={n_ones}")
+            n = df[x].notna().sum()
+            n1 = (df[x] == 1).sum() if pd.api.types.is_numeric_dtype(df[x]) else "?"
+            print(f"  ✓ {x}: N={n}, treated={n1}")
         else:
-            print(f"  {status} {x}: 不存在")
+            print(f"  ✗ {x}")
 
-    print("\n--- 被解释变量可用性 ---")
+    print("\n--- 被解释变量 ---")
     for ch, yvars in config.Y_VARS.items():
         found = [v for v in yvars if v in cols]
+        missing = [v for v in yvars if v not in cols]
         print(f"  第{ch}章: {len(found)}/{len(yvars)} 可用")
-        for v in found[:5]:  # 只显示前5个
-            print(f"    ✓ {v}: N={df[v].notna().sum()}")
-        if len(found) > 5:
-            print(f"    ... 及其他 {len(found) - 5} 个")
+        if missing:
+            print(f"    缺失: {missing[:5]}{'...' if len(missing) > 5 else ''}")
+
+    print("\n--- 控制变量 ---")
+    for name, cvars in config.CONTROL_GROUPS.items():
+        found = [v for v in cvars if v in cols]
+        print(f"  {name}: {len(found)}/{len(cvars)} 可用")
+
+    # 稳健性X
+    rob_found = [v for v in config.X_VARS_ROBUSTNESS if v in cols]
+    print(f"\n--- 稳健性X变量: {len(rob_found)}/{len(config.X_VARS_ROBUSTNESS)} 可用 ---")
 
 
 def run_chapter_search(
@@ -211,37 +204,29 @@ def run_chapter_search(
     is_ch5_robustness: bool = False,
 ) -> list[dict]:
     """
-    运行单章的完整搜索流程。
-
-    Phase 1: 快速扫描所有 X-Y 组合
-    Phase 2: 深度搜索有希望的组合
-    Phase 3: 平行趋势验证
-    Phase 4: PSM-DID（如适用）
-
-    Returns
-    -------
-    list[dict]
-        所有满足约束的结果记录
+    运行单章完整搜索:
+    Phase 1 → 快速扫描 (所有X-Y, 默认设定, 遍历样本区间)
+    Phase 2 → 深度搜索 (变化控制变量/FE/聚类/筛选)
+    Phase 3 → 平行趋势检验
     """
     all_qualified = []
 
     # -------- Phase 1: 快速扫描 --------
-    print(f"\n  --- Phase 1: 快速扫描 ---")
+    log.info(f"Phase 1: 快速扫描")
     phase1_specs = generate_phase1_grid(chapter)
     promising_pairs = set()
     phase1_results = []
+    n_total = len(phase1_specs)
 
     for i, spec in enumerate(phase1_specs):
-        if (i + 1) % 50 == 0:
-            print(f"    进度: {i + 1}/{len(phase1_specs)}")
+        if (i + 1) % max(n_total // 5, 1) == 0:
+            log.info(f"  Phase 1 进度: {i + 1}/{n_total}")
 
         result = _run_single_spec(raw_df, spec)
         if result is None:
             continue
-
         phase1_results.append(result)
 
-        # 检查方向和显著性
         coef = result.get("coef", np.nan)
         pval = result.get("pval", np.nan)
 
@@ -252,44 +237,39 @@ def run_chapter_search(
                                  r2=result.get("r2", np.nan), success=True),
                 chapter,
             )
-
-            # 如果已经二星显著，加入候选
             if check_significance(pval, 0.05):
                 all_qualified.append(result)
 
-    print(f"    Phase 1 完成: {len(promising_pairs)} 个有希望的 (Y, X) 组合")
-    print(f"    已找到 {len(all_qualified)} 个二星以上结果")
+    log.info(f"  Phase 1: {len(promising_pairs)} 组合方向正确, {len(all_qualified)} 个≥2星")
 
     if not promising_pairs:
-        print("    [警告] Phase 1 未找到任何方向正确的组合，尝试放宽条件...")
-        # 放宽: 只要求方向正确
+        log.warning("  Phase 1 无方向正确组合，放宽条件...")
         for r in phase1_results:
             if check_sign(r.get("coef", np.nan), chapter):
                 promising_pairs.add((r["y_var"], r["x_var"]))
 
     if not promising_pairs:
-        print("    [警告] 仍然没有找到，返回空")
+        log.warning("  仍无结果")
         return all_qualified
 
-    # 限制组合数量
+    # 限制组合数
     promising_pairs = list(promising_pairs)
-    if len(promising_pairs) > 20:
-        # 按 Phase 1 得分排序，取 Top 20
-        pair_scores = defaultdict(float)
+    if len(promising_pairs) > 15:
+        pair_scores = defaultdict(lambda: float("-inf"))
         for r in phase1_results:
             key = (r["y_var"], r["x_var"])
-            if key in promising_pairs:
-                pair_scores[key] = max(pair_scores[key], r.get("score", float("-inf")))
+            pair_scores[key] = max(pair_scores[key], r.get("score", float("-inf")))
         promising_pairs.sort(key=lambda p: pair_scores[p], reverse=True)
-        promising_pairs = promising_pairs[:20]
+        promising_pairs = promising_pairs[:15]
 
     # -------- Phase 2: 深度搜索 --------
-    print(f"\n  --- Phase 2: 深度搜索 ({len(promising_pairs)} 组合) ---")
+    log.info(f"Phase 2: 深度搜索 ({len(promising_pairs)} 组合)")
     phase2_specs = generate_phase2_grid(chapter, promising_pairs)
+    n_total = len(phase2_specs)
 
     for i, spec in enumerate(phase2_specs):
-        if (i + 1) % 200 == 0:
-            print(f"    进度: {i + 1}/{len(phase2_specs)}")
+        if (i + 1) % max(n_total // 10, 1) == 0:
+            log.info(f"  Phase 2 进度: {i + 1}/{n_total}")
 
         result = _run_single_spec(raw_df, spec)
         if result is None:
@@ -306,28 +286,28 @@ def run_chapter_search(
             )
             all_qualified.append(result)
 
-    print(f"    Phase 2 完成: 共 {len(all_qualified)} 个合格结果")
+    log.info(f"  Phase 2: 共 {len(all_qualified)} 个合格结果")
 
     if not all_qualified:
-        print("    [警告] 未找到任何满足约束的设定")
+        log.warning("  未找到满足约束的设定")
         return all_qualified
 
     # -------- Phase 3: 平行趋势 --------
-    print(f"\n  --- Phase 3: 平行趋势检验 ---")
+    log.info(f"Phase 3: 平行趋势检验")
 
-    # 取 Top 设定
     all_qualified.sort(key=lambda r: r.get("score", float("-inf")), reverse=True)
+
+    # 去重取 Top 设定
     top_specs = []
     seen = set()
-    for r in all_qualified[:50]:
+    for r in all_qualified[:80]:
         key = (r["y_var"], r["x_var"], r.get("controls_group", ""),
+               "+".join(r.get("fe_vars", [])), "+".join(r.get("cluster_vars", [])),
                r.get("start_year", 0), r.get("end_year", 0))
         if key not in seen:
             seen.add(key)
-            spec = SpecConfig(
-                chapter=chapter,
-                y_var=r["y_var"],
-                x_var=r["x_var"],
+            top_specs.append(SpecConfig(
+                chapter=chapter, y_var=r["y_var"], x_var=r["x_var"],
                 controls_group=r.get("controls_group", ""),
                 controls=r.get("controls", []),
                 fe_vars=r.get("fe_vars", []),
@@ -335,18 +315,18 @@ def run_chapter_search(
                 start_year=r.get("start_year", 2007),
                 end_year=r.get("end_year", 2023),
                 filters=r.get("filters", {}),
-            )
-            top_specs.append(spec)
+            ))
 
-    if len(top_specs) > 20:
-        top_specs = top_specs[:20]
+    if len(top_specs) > 30:
+        top_specs = top_specs[:30]
 
     pt_specs = generate_phase3_pt_grid(chapter, top_specs)
-
+    n_total = len(pt_specs)
     pt_qualified = []
+
     for i, spec in enumerate(pt_specs):
-        if (i + 1) % 50 == 0:
-            print(f"    进度: {i + 1}/{len(pt_specs)}")
+        if (i + 1) % max(n_total // 10, 1) == 0:
+            log.info(f"  Phase 3 进度: {i + 1}/{n_total}")
 
         pt_result = _run_parallel_trends_spec(raw_df, spec, chapter)
         if pt_result is None:
@@ -354,79 +334,59 @@ def run_chapter_search(
 
         pt_score = evaluate_parallel_trends(pt_result, chapter)
         if pt_score > float("-inf"):
-            # 找到对应的主回归结果
             matching = [r for r in all_qualified
                         if r["y_var"] == spec.y_var and r["x_var"] == spec.x_var
                         and r.get("start_year") == spec.start_year
-                        and r.get("end_year") == spec.end_year]
+                        and r.get("end_year") == spec.end_year
+                        and r.get("controls_group") == spec.controls_group]
 
             if matching:
                 best_match = max(matching, key=lambda r: r.get("score", float("-inf")))
-                combined_score = best_match.get("score", 0) + pt_score
-
                 record = best_match.copy()
                 record["pt_score"] = pt_score
-                record["score"] = combined_score
+                record["score"] = best_match.get("score", 0) + pt_score
                 record["pt_result"] = pt_result
                 record["pt_pre_window"] = spec.pt_pre_window
                 record["pt_post_window"] = spec.pt_post_window
                 record["pt_base_period"] = spec.pt_base_period
                 pt_qualified.append(record)
 
-    print(f"    Phase 3 完成: {len(pt_qualified)} 个通过平行趋势检验")
+    log.info(f"  Phase 3: {len(pt_qualified)} 个通过平行趋势")
 
-    # 如果有通过平行趋势的结果，优先使用
     if pt_qualified:
         pt_qualified.sort(key=lambda r: r.get("score", float("-inf")), reverse=True)
         return pt_qualified
-    else:
-        # 如果是第五章且为稳健性，不要求平行趋势
-        if is_ch5_robustness:
-            print("    [第五章] 作为稳健性检验，不要求平行趋势通过")
-            return all_qualified[:20]
 
-        print("    [警告] 无设定通过平行趋势检验")
-        print("    返回主回归最优结果（附注：需补充平行趋势）")
-        return all_qualified[:20]
+    if is_ch5_robustness:
+        log.info("  第5章作为稳健性检验，不要求平行趋势")
+        return all_qualified[:30]
+
+    log.warning("  无设定通过平行趋势，返回主回归最优结果")
+    return all_qualified[:30]
 
 
 def _run_single_spec(raw_df: pd.DataFrame, spec: SpecConfig) -> dict | None:
-    """
-    运行单个回归设定。
-
-    Returns
-    -------
-    dict or None
-        结果字典
-    """
+    """运行单个回归设定。"""
     try:
-        # 应用样本筛选
-        df = apply_sample_filters(
-            raw_df, spec.start_year, spec.end_year, spec.filters,
-        )
-
+        df = apply_sample_filters(raw_df, spec.start_year, spec.end_year, spec.filters)
         if len(df) < 100:
             return None
 
-        # 缩尾
         winsorize_level = spec.filters.get("winsorize")
         if winsorize_level:
             cont_vars = get_continuous_vars(df, [spec.y_var] + spec.controls)
             df = winsorize_variables(df, cont_vars, winsorize_level)
 
-        # 运行回归
         result = run_ols_fe(
             df, spec.y_var, spec.x_var,
             spec.controls, spec.fe_vars, spec.cluster_vars,
         )
-
         if not result.success:
             return None
 
         return {
             "chapter": spec.chapter,
-            "y_var": spec.y_var,
-            "x_var": spec.x_var,
+            "y_var": spec.y_var, "x_var": spec.x_var,
             "controls_group": spec.controls_group,
             "controls": spec.controls,
             "fe_vars": spec.fe_vars,
@@ -434,17 +394,13 @@ def _run_single_spec(raw_df: pd.DataFrame, spec: SpecConfig) -> dict | None:
             "start_year": spec.start_year,
             "end_year": spec.end_year,
             "filters": spec.filters,
-            "coef": result.coef,
-            "se": result.se,
-            "tstat": result.tstat,
-            "pval": result.pval,
+            "coef": result.coef, "se": result.se,
+            "tstat": result.tstat, "pval": result.pval,
             "stars": result.stars,
-            "nobs": result.nobs,
-            "r2": result.r2,
+            "nobs": result.nobs, "r2": result.r2,
             "reg_result": result,
         }
-
-    except Exception as e:
+    except Exception:
         return None
 
 
@@ -455,10 +411,7 @@ def _run_parallel_trends_spec(
 ) -> PTResult | None:
     """运行单个平行趋势设定。"""
     try:
-        df = apply_sample_filters(
-            raw_df, spec.start_year, spec.end_year, spec.filters,
-        )
-
+        df = apply_sample_filters(raw_df, spec.start_year, spec.end_year, spec.filters)
         if len(df) < 100:
             return None
 
@@ -467,7 +420,6 @@ def _run_parallel_trends_spec(
             cont_vars = get_continuous_vars(df, [spec.y_var] + spec.controls)
             df = winsorize_variables(df, cont_vars, winsorize_level)
 
-        # 生成事件时间
         df = generate_event_time(df, spec.x_var)
 
         pt = run_parallel_trends(
@@ -478,9 +430,7 @@ def _run_parallel_trends_spec(
             base_period=spec.pt_base_period,
             chapter=chapter,
         )
-
         return pt if pt.success else None
-
     except Exception:
         return None
 
@@ -488,113 +438,159 @@ def _run_parallel_trends_spec(
 def generate_chapter_output(
     raw_df: pd.DataFrame,
     best: dict,
+    all_results: list[dict],
     chapter: int,
     output_dir: str,
 ):
-    """
-    为一章生成全部输出: 表格 + 图形。
-    """
+    """为一章生成完整输出: 表格(docx) + 图形(png) + Stata代码(do)。"""
     ch_dir = os.path.join(output_dir, f"Chapter{chapter}")
     os.makedirs(ch_dir, exist_ok=True)
 
-    print(f"\n  --- 生成第{chapter}章输出 ---")
-    print(f"    X: {best['x_var']}, Y: {best['y_var']}")
-    print(f"    区间: {best['start_year']}-{best['end_year']}")
-    print(f"    控制变量组: {best.get('controls_group', 'N/A')}")
+    log.info(f"生成第{chapter}章输出:")
+    log.info(f"  X={best['x_var']}, Y={best['y_var']}, "
+             f"区间={best['start_year']}-{best['end_year']}")
 
-    # 应用同样的样本筛选
+    # 准备统一样本
+    set_verbose(True)
     df = apply_sample_filters(
         raw_df, best["start_year"], best["end_year"], best.get("filters", {}),
     )
+    set_verbose(False)
 
-    winsorize_level = best.get("filters", {}).get("winsorize")
     controls = best.get("controls", [])
+    winsorize_level = best.get("filters", {}).get("winsorize")
     if winsorize_level:
         cont_vars = get_continuous_vars(df, [best["y_var"], best["x_var"]] + controls)
         df = winsorize_variables(df, cont_vars, winsorize_level)
 
-    # 确保样本量一致: 先做 listwise deletion
+    # Listwise deletion 确保 N 一致
     all_vars = [best["y_var"], best["x_var"]] + controls
     available_vars = [v for v in all_vars if v in df.columns]
     df_complete = df.dropna(subset=available_vars)
-
-    print(f"    完整样本量: {len(df_complete)}")
+    log.info(f"  统一样本 N={len(df_complete)}")
 
     # 1. 描述统计
     stats_vars = [best["x_var"], best["y_var"]] + controls
-    stats_vars = [v for v in stats_vars if v in df_complete.columns]
+    stats_vars = list(dict.fromkeys(v for v in stats_vars if v in df_complete.columns))
     desc_stats = compute_descriptive_stats(df_complete, stats_vars)
 
     # 2. 相关系数
-    corr_vars = [best["x_var"], best["y_var"]] + controls[:8]  # 限制变量数
-    corr_vars = [v for v in corr_vars if v in df_complete.columns]
+    corr_vars = [best["x_var"], best["y_var"]] + controls[:8]
+    corr_vars = list(dict.fromkeys(v for v in corr_vars if v in df_complete.columns))
     corr_matrix = compute_correlation_matrix(df_complete, corr_vars)
 
-    # 3. 主回归
-    main_result = best.get("reg_result")
-    if main_result is None:
+    # 3. 主回归 — 收集同一 X 下的多个 Y 结果
+    main_results = []
+    best_x = best["x_var"]
+    best_fe = best.get("fe_vars", [])
+    best_cl = best.get("cluster_vars", [])
+
+    # 找同一设定下的其他 Y（同X、同控制变量组、同区间）
+    same_spec_results = [
+        r for r in all_results
+        if r["x_var"] == best_x
+        and r.get("controls_group") == best.get("controls_group")
+        and r.get("start_year") == best.get("start_year")
+        and r.get("end_year") == best.get("end_year")
+    ]
+
+    # 按 Y 去重，取最优
+    y_best = {}
+    for r in same_spec_results:
+        yv = r["y_var"]
+        if yv not in y_best or r.get("score", 0) > y_best[yv].get("score", 0):
+            y_best[yv] = r
+
+    # 主回归表: 先放 best Y，然后加其他显著的 Y
+    if best.get("reg_result"):
+        main_results.append(best["reg_result"])
+
+    for yv, r in sorted(y_best.items(), key=lambda x: x[1].get("score", 0), reverse=True):
+        if yv != best["y_var"] and r.get("reg_result") and len(main_results) < 6:
+            main_results.append(r["reg_result"])
+
+    # 如果只有1个结果，用完整样本重新跑
+    if not main_results:
         main_result = run_ols_fe(
             df_complete, best["y_var"], best["x_var"],
-            controls, best.get("fe_vars", []), best.get("cluster_vars", []),
+            controls, best_fe, best_cl,
         )
+        if main_result.success:
+            main_results = [main_result]
 
-    # 尝试 PSM-DID
+    # 4. PSM-DID
     psm_result = None
     try:
         psm_result = run_psm_did(
             df_complete, best["y_var"], best["x_var"],
-            controls, best.get("fe_vars", []), best.get("cluster_vars", []),
+            controls, best_fe, best_cl,
             psm_config={"method": "nearest", "n_neighbors": 1, "caliper": 0.05},
         )
         if not psm_result.success:
             psm_result = None
     except Exception:
-        psm_result = None
+        pass
 
-    # 4. 平行趋势
+    # 5. 平行趋势
+    pt_results = []
     pt_result = best.get("pt_result")
     if pt_result is None:
         df_event = generate_event_time(df_complete, best["x_var"])
         pt_result = run_parallel_trends(
             df_event, best["y_var"], best["x_var"],
-            controls, best.get("fe_vars", []), best.get("cluster_vars", []),
+            controls, best_fe, best_cl,
             pre_window=best.get("pt_pre_window", -3),
             post_window=best.get("pt_post_window", 3),
             base_period=best.get("pt_base_period", "pre1"),
             chapter=chapter,
         )
+    if pt_result and pt_result.success:
+        pt_results.append(pt_result)
 
-    # 生成表格文档
+    # 对其他 Y 也生成平行趋势（如果有）
+    for yv, r in y_best.items():
+        if yv != best["y_var"] and r.get("pt_result") and len(pt_results) < 4:
+            pt_results.append(r["pt_result"])
+
+    # 生成 Word 表格
     save_chapter_tables(
         chapter=chapter,
         desc_stats=desc_stats,
         corr_matrix=corr_matrix,
-        main_results=[main_result] if isinstance(main_result, RegressionResult) else [],
+        main_results=main_results,
         psm_result=psm_result,
-        pt_results=[pt_result] if pt_result and pt_result.success else [],
+        pt_results=pt_results,
         controls_list=controls,
         output_dir=ch_dir,
     )
 
     # 生成动态效应图
-    if pt_result and pt_result.success:
-        plot_dynamic_effects(
-            pt_result,
-            output_path=os.path.join(ch_dir, f"动态效应图_{best['y_var']}.png"),
-            title=f"第{chapter}章 动态效应图: {best['y_var']}",
+    for pt in pt_results:
+        if pt.success:
+            plot_dynamic_effects(
+                pt,
+                output_path=os.path.join(ch_dir, f"动态效应图_{pt.y_var}.png"),
+                title=f"Ch.{chapter} Dynamic Effects: {pt.y_var}",
+                chapter=chapter,
+                y_label=pt.y_var,
+            )
+
+    # 多Y对比图
+    if len(pt_results) > 1:
+        plot_multiple_dynamic_effects(
+            pt_results,
+            output_path=os.path.join(ch_dir, f"动态效应对比图.png"),
+            title=f"第{chapter}章 动态效应对比",
             chapter=chapter,
-            y_label=best["y_var"],
         )
 
 
 def save_search_log(state: SearchState, output_dir: str):
-    """保存完整搜索日志。"""
-    log_path = os.path.join(output_dir, "search_log.xlsx")
-
-    all_records = []
+    """保存搜索日志。"""
+    records = []
     for ch, results in state.chapter_results.items():
         for r in results:
-            record = {
+            records.append({
                 "Chapter": ch,
                 "Y": r.get("y_var", ""),
                 "X": r.get("x_var", ""),
@@ -602,6 +598,7 @@ def save_search_log(state: SearchState, output_dir: str):
                 "FE": "+".join(r.get("fe_vars", [])),
                 "Cluster": "+".join(r.get("cluster_vars", [])),
                 "Period": f"{r.get('start_year', '')}-{r.get('end_year', '')}",
+                "Filters": str({k: v for k, v in r.get("filters", {}).items() if v}),
                 "Coef": r.get("coef", np.nan),
                 "SE": r.get("se", np.nan),
                 "t-stat": r.get("tstat", np.nan),
@@ -611,41 +608,41 @@ def save_search_log(state: SearchState, output_dir: str):
                 "R2": r.get("r2", np.nan),
                 "Score": r.get("score", np.nan),
                 "PT_Score": r.get("pt_score", np.nan),
-            }
-            all_records.append(record)
+                "PT_Pre": r.get("pt_pre_window", ""),
+                "PT_Post": r.get("pt_post_window", ""),
+                "PT_Base": r.get("pt_base_period", ""),
+            })
 
-    if all_records:
-        log_df = pd.DataFrame(all_records)
+    if records:
+        log_df = pd.DataFrame(records)
+        log_path = os.path.join(output_dir, "search_log.xlsx")
         log_df.to_excel(log_path, index=False)
-        print(f"\n  搜索日志已保存: {log_path}")
-        print(f"  共 {len(log_df)} 条记录")
-    else:
-        print("\n  [警告] 无搜索记录可保存")
+        log.info(f"搜索日志: {log_path} ({len(log_df)} 条)")
 
-    # 最优设定 JSON
+    # JSON
     best_path = os.path.join(output_dir, "best_specifications.json")
     best_info = {}
     for ch, best in state.best_specs.items():
         if best:
-            best_copy = {k: v for k, v in best.items()
-                         if k not in ["reg_result", "pt_result"]}
-            # 转换 numpy 类型
-            for k, v in best_copy.items():
+            info = {}
+            for k, v in best.items():
+                if k in ("reg_result", "pt_result"):
+                    continue
                 if isinstance(v, (np.floating, np.integer)):
-                    best_copy[k] = float(v)
+                    info[k] = float(v)
                 elif isinstance(v, np.ndarray):
-                    best_copy[k] = v.tolist()
-            best_info[f"Chapter{ch}"] = best_copy
+                    info[k] = v.tolist()
+                else:
+                    info[k] = v
+            best_info[f"Chapter{ch}"] = info
 
     with open(best_path, "w", encoding="utf-8") as f:
         json.dump(best_info, f, ensure_ascii=False, indent=2)
-    print(f"  最优设定已保存: {best_path}")
+    log.info(f"最优设定: {best_path}")
 
 
 def generate_stata_code(state: SearchState, output_dir: str):
-    """
-    生成等价的 Stata .do 代码，确保可复现。
-    """
+    """为各章生成等价的 Stata .do 文件。"""
     for chapter in [3, 4, 5]:
         best = state.best_specs.get(chapter)
         if not best:
@@ -654,240 +651,210 @@ def generate_stata_code(state: SearchState, output_dir: str):
         do_path = os.path.join(output_dir, f"Chapter{chapter}", f"chapter{chapter}_code.do")
         os.makedirs(os.path.dirname(do_path), exist_ok=True)
 
-        y_var = best["y_var"]
-        x_var = best["x_var"]
-        controls = best.get("controls", [])
-        fe_vars = best.get("fe_vars", [])
-        cluster_vars = best.get("cluster_vars", [])
-        start_year = best.get("start_year", 2007)
-        end_year = best.get("end_year", 2023)
-        filters = best.get("filters", {})
+        y = best["y_var"]
+        x = best["x_var"]
+        ctrls = best.get("controls", [])
+        fe = best.get("fe_vars", [])
+        cl = best.get("cluster_vars", [])
+        sy = best.get("start_year", 2007)
+        ey = best.get("end_year", 2023)
+        filt = best.get("filters", {})
         pt_pre = best.get("pt_pre_window", -3)
         pt_post = best.get("pt_post_window", 3)
         pt_base = best.get("pt_base_period", "pre1")
-        ctrl_str = " ".join(controls)
 
-        # FE 和 聚类
-        fe_cmd = ""
-        absorb_vars = []
-        for fv in fe_vars:
-            absorb_vars.append(fv)
-        absorb_str = " ".join(absorb_vars) if absorb_vars else "Year"
+        ctrl_str = " ".join(ctrls)
+        absorb_str = " ".join(fe) if fe else "Year"
+        cluster_str = cl[0] if cl else "Stkcd"
 
-        cluster_str = cluster_vars[0] if cluster_vars else "Stkcd"
+        omit_val = {"pre1": -1, "pre0": 0, "pre_biggest": pt_pre}.get(pt_base, -1)
+        omit_label = {"pre1": "pre1", "pre0": "current",
+                      "pre_biggest": f"pre{abs(pt_pre)}"}.get(pt_base, "pre1")
 
-        # 生成 do 文件
-        code = f"""/*
-============================================================
-第{chapter}章 回归代码 — 自动生成
-数字并购与企业内部利益相关者价值效应
-============================================================
-生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-Y变量: {y_var}
-X变量: {x_var}
-控制变量: {ctrl_str}
-固定效应: {' + '.join(fe_vars)}
-聚类: {' + '.join(cluster_vars)}
-样本区间: {start_year}-{end_year}
-============================================================
-*/
+        code_lines = [
+            f"/*",
+            f"{'=' * 60}",
+            f"第{chapter}章 回归代码 — 自动生成 by Specification Search",
+            f"{'=' * 60}",
+            f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            f"Y: {y}  |  X: {x}",
+            f"Controls: {ctrl_str}",
+            f"FE: {' + '.join(fe)}  |  Cluster: {' + '.join(cl)}",
+            f"Sample: {sy}-{ey}",
+            f"Coef={best.get('coef', 'NA'):.4f}, p={best.get('pval', 'NA'):.4f}{best.get('stars', '')}",
+            f"{'=' * 60}",
+            f"*/",
+            f"",
+            f"clear all",
+            f"set more off",
+            f"set matsize 10000",
+            f"",
+            f'* {"=" * 50}',
+            f"* 1. 数据加载",
+            f'* {"=" * 50}',
+            f'use "{config.DATA_PATH}", clear',
+            f"",
+            f'* {"=" * 50}',
+            f"* 2. 样本筛选",
+            f'* {"=" * 50}',
+            f"keep if {config.YEAR_VAR} >= {sy} & {config.YEAR_VAR} <= {ey}",
+        ]
 
-clear all
-set more off
-set matsize 10000
+        if filt.get("drop_st_pt"):
+            code_lines += [
+                "",
+                "* 剔除 ST/PT",
+                "capture confirm variable ST",
+                'if !_rc drop if ST == 1',
+                "capture confirm variable Stkname",
+                'if !_rc drop if regexm(Stkname, \"ST|PT|\\*ST\")',
+            ]
 
-* ============================================================
-* 1. 数据加载
-* ============================================================
-use "{config.DATA_PATH}", clear
+        if filt.get("drop_finance"):
+            code_lines += [
+                "",
+                "* 剔除金融行业",
+                'capture drop if substr(Ind, 1, 1) == "J"',
+            ]
 
-* ============================================================
-* 2. 样本筛选
-* ============================================================
-* 样本区间
-keep if {config.YEAR_VAR} >= {start_year} & {config.YEAR_VAR} <= {end_year}
-"""
-        # 样本筛选条件
-        if filters.get("drop_st_pt"):
-            code += """
-* 剔除ST/PT
-* 方法1: 如果有ST标识变量
-capture drop if ST == 1
-* 方法2: 如果有股票简称
-capture drop if regexm(Stkname, "ST|PT|\\*ST")
-"""
-        if filters.get("drop_finance"):
-            code += """
-* 剔除金融行业 (证监会J门类)
-capture drop if substr(string(Ind), 1, 1) == "J"
-capture drop if substr(Ind, 1, 1) == "J"
-"""
-        if filters.get("drop_real_estate"):
-            code += """
-* 剔除房地产行业 (证监会K门类)
-capture drop if substr(string(Ind), 1, 1) == "K"
-capture drop if substr(Ind, 1, 1) == "K"
-"""
-        if filters.get("drop_lev_gt1"):
-            code += """
-* 剔除资产负债率>1
-drop if Lev > 1 & Lev != .
-"""
-        if filters.get("drop_ind_lt30"):
-            code += """
-* 剔除行业观测<30的行业
-bysort Ind: gen _ind_n = _N
-drop if _ind_n < 30
-drop _ind_n
-"""
-        # 缩尾
-        winsorize = filters.get("winsorize")
+        if filt.get("drop_real_estate"):
+            code_lines += [
+                "",
+                "* 剔除房地产行业",
+                'capture drop if substr(Ind, 1, 1) == "K"',
+            ]
+
+        if filt.get("drop_lev_gt1"):
+            code_lines += [
+                "",
+                "* 剔除 Lev > 1",
+                "drop if Lev > 1 & Lev != .",
+            ]
+
+        if filt.get("drop_ind_lt30"):
+            code_lines += [
+                "",
+                "* 剔除行业观测 < 30",
+                "bysort Ind: gen _ind_n = _N",
+                "drop if _ind_n < 30",
+                "drop _ind_n",
+            ]
+
+        winsorize = filt.get("winsorize")
         if winsorize:
             pct = int(winsorize * 100)
-            code += f"""
-* 连续变量缩尾 ({pct}%)
-foreach var of varlist {y_var} {ctrl_str} {{
-    capture winsor2 `var', replace cuts({pct} {100 - pct})
-}}
-"""
+            code_lines += [
+                "",
+                f"* 连续变量缩尾 ({pct}%)",
+                f"foreach var of varlist {y} {ctrl_str} {{",
+                f"    capture winsor2 `var', replace cuts({pct} {100 - pct})",
+                f"}}",
+            ]
 
-        code += f"""
-* ============================================================
-* 3. 描述统计
-* ============================================================
-* 确保样本一致: 删除关键变量缺失值
-drop if missing({y_var})
-drop if missing({x_var})
-foreach var of varlist {ctrl_str} {{
-    drop if missing(`var')
-}}
-
-summarize {x_var} {y_var} {ctrl_str}, detail
-
-* ============================================================
-* 4. 相关系数矩阵
-* ============================================================
-pwcorr {x_var} {y_var} {ctrl_str}, star(0.05)
-
-* ============================================================
-* 5. 主回归 (固定效应)
-* ============================================================
-* 方法: reghdfe (需安装: ssc install reghdfe)
-reghdfe {y_var} {x_var} {ctrl_str}, absorb({absorb_str}) vce(cluster {cluster_str})
-
-* 保存结果
-est store main_reg
-"""
-        # PSM-DID
-        code += f"""
-* ============================================================
-* 6. PSM-DID
-* ============================================================
-* Step 1: 倾向得分匹配
-* 构造企业层面处理组标识
-bysort {config.FIRM_ID}: egen _ever_treated = max({x_var})
-logit _ever_treated {ctrl_str}
-predict _pscore, pr
-
-* Step 2: 最近邻匹配 (1:1, caliper=0.05)
-* 需要安装 psmatch2: ssc install psmatch2
-psmatch2 _ever_treated, pscore(_pscore) neighbor(1) caliper(0.05)
-
-* Step 3: 平衡性检验
-pstest {ctrl_str}, both
-
-* Step 4: 匹配后回归
-reghdfe {y_var} {x_var} {ctrl_str} if _weight != ., absorb({absorb_str}) vce(cluster {cluster_str})
-est store psm_reg
-"""
-        # 平行趋势
-        if pt_base == "pre1":
-            omit_label = "pre1"
-            omit_val = -1
-        elif pt_base == "pre0":
-            omit_label = "current"
-            omit_val = 0
-        else:
-            omit_label = f"pre{abs(pt_pre)}"
-            omit_val = pt_pre
-
-        code += f"""
-* ============================================================
-* 7. 平行趋势检验 (事件研究法)
-* ============================================================
-* 生成事件时间变量
-bysort {config.FIRM_ID}: egen _first_treat_year = min({config.YEAR_VAR}) if {x_var} == 1
-bysort {config.FIRM_ID}: egen event_year = min(_first_treat_year)
-gen event_time = {config.YEAR_VAR} - event_year
-
-* 生成事件时间哑变量
-"""
-        for p in range(pt_pre, pt_post + 1):
-            if p == omit_val:
-                continue
-            if p < 0:
-                name = f"pre{abs(p)}"
-            elif p == 0:
-                name = "current"
-            else:
-                name = f"post{p}"
-            code += f'gen {name} = (event_time == {p}) & !missing(event_year)\n'
+        code_lines += [
+            "",
+            f'* {"=" * 50}',
+            f"* 3. 样本一致性 (listwise deletion)",
+            f'* {"=" * 50}',
+            f"drop if missing({y})",
+            f"drop if missing({x})",
+            f"foreach var of varlist {ctrl_str} {{",
+            f"    drop if missing(`var')",
+            f"}}",
+            "",
+            f'* {"=" * 50}',
+            f"* 4. 描述统计",
+            f'* {"=" * 50}',
+            f"summarize {x} {y} {ctrl_str}, detail",
+            "",
+            f'* {"=" * 50}',
+            f"* 5. 相关系数矩阵",
+            f'* {"=" * 50}',
+            f"pwcorr {x} {y} {ctrl_str}, star(0.05)",
+            "",
+            f'* {"=" * 50}',
+            f"* 6. 主回归 (reghdfe)",
+            f'* {"=" * 50}',
+            f"* ssc install reghdfe",
+            f"reghdfe {y} {x} {ctrl_str}, absorb({absorb_str}) vce(cluster {cluster_str})",
+            f"est store main_reg",
+            "",
+            f'* {"=" * 50}',
+            f"* 7. PSM-DID",
+            f'* {"=" * 50}',
+            f"* ssc install psmatch2",
+            f"bysort {config.FIRM_ID}: egen _ever_treated = max({x})",
+            f"logit _ever_treated {ctrl_str}",
+            f"predict _pscore, pr",
+            f"psmatch2 _ever_treated, pscore(_pscore) neighbor(1) caliper(0.05)",
+            f"pstest {ctrl_str}, both",
+            f"reghdfe {y} {x} {ctrl_str} if _weight != ., absorb({absorb_str}) vce(cluster {cluster_str})",
+            f"est store psm_reg",
+            "",
+            f'* {"=" * 50}',
+            f"* 8. 平行趋势检验 (事件研究法)",
+            f'* {"=" * 50}',
+            f"* 生成事件时间变量",
+            f"capture drop _first_treat_year event_year event_time",
+            f"bysort {config.FIRM_ID}: egen _first_treat_year = min({config.YEAR_VAR}) if {x} == 1",
+            f"bysort {config.FIRM_ID}: egen event_year = min(_first_treat_year)",
+            f"gen event_time = {config.YEAR_VAR} - event_year",
+            f"drop _first_treat_year",
+            "",
+            f"* 事件时间哑变量 (基期: {omit_label})",
+        ]
 
         dummies = []
         for p in range(pt_pre, pt_post + 1):
             if p == omit_val:
                 continue
-            if p < 0:
-                dummies.append(f"pre{abs(p)}")
-            elif p == 0:
-                dummies.append("current")
-            else:
-                dummies.append(f"post{p}")
+            name = f"pre{abs(p)}" if p < 0 else ("current" if p == 0 else f"post{p}")
+            dummies.append(name)
+            code_lines.append(
+                f"gen {name} = (event_time == {p}) & !missing(event_year)"
+            )
+
         dummies_str = " ".join(dummies)
+        code_lines += [
+            "",
+            f"reghdfe {y} {dummies_str} {ctrl_str}, absorb({absorb_str}) vce(cluster {cluster_str})",
+            f"est store pt_reg",
+            "",
+            f'* {"=" * 50}',
+            f"* 9. 动态效应图",
+            f'* {"=" * 50}',
+            f"* ssc install coefplot",
+            f"coefplot, keep({dummies_str}) ///",
+            f"    vertical ///",
+            f"    yline(0, lpattern(dash) lcolor(black)) ///",
+            f"    ylabel(, angle(horizontal)) ///",
+            f'    title("第{chapter}章 动态效应图") ///',
+            f'    xtitle("Event Time") ytitle("Coefficient") ///',
+            f"    msymbol(O) mcolor(navy) ///",
+            f"    ciopts(lcolor(navy) lwidth(thin)) ///",
+            f"    graphregion(color(white)) bgcolor(white)",
+            f'graph export "动态效应图_{y}.png", replace width(1200)',
+            "",
+            f'* {"=" * 50}',
+            f"* 10. 输出回归表",
+            f'* {"=" * 50}',
+            f"* ssc install esttab",
+            f'esttab main_reg psm_reg pt_reg using "第{chapter}章_回归结果.rtf", ///',
+            f"    replace ///",
+            f"    star(* 0.10 ** 0.05 *** 0.01) ///",
+            f"    b(%9.4f) se(%9.4f) ///",
+            f'    stats(N r2_a, labels("N" "Adj. R²") fmt(%9.0fc %9.4f)) ///',
+            f'    title("第{chapter}章 回归结果") ///',
+            f'    mtitles("Baseline" "PSM-DID" "Parallel Trends") ///',
+            f'    note("聚类稳健标准误; *** p<0.01, ** p<0.05, * p<0.10")',
+            "",
+            f"* End of Chapter {chapter}",
+        ]
 
-        code += f"""
-* 回归 (基期: {omit_label})
-reghdfe {y_var} {dummies_str} {ctrl_str}, absorb({absorb_str}) vce(cluster {cluster_str})
-est store pt_reg
-
-* ============================================================
-* 8. 动态效应图
-* ============================================================
-coefplot, keep({dummies_str}) ///
-    vertical ///
-    yline(0, lpattern(dash) lcolor(black)) ///
-    xline({abs(omit_val) + 1}, lpattern(dash) lcolor(red)) ///
-    ylabel(, angle(horizontal)) ///
-    xlabel(, angle(0)) ///
-    title("第{chapter}章 动态效应图") ///
-    xtitle("Event Time") ///
-    ytitle("Coefficient") ///
-    msymbol(O) mcolor(navy) ///
-    ciopts(lcolor(navy) lwidth(thin)) ///
-    graphregion(color(white)) bgcolor(white)
-
-graph export "动态效应图_{y_var}.png", replace width(1200)
-
-* ============================================================
-* 9. 输出回归结果表
-* ============================================================
-* 需要安装: ssc install esttab
-esttab main_reg psm_reg pt_reg using "第{chapter}章_回归结果.rtf", ///
-    replace ///
-    star(* 0.10 ** 0.05 *** 0.01) ///
-    b(%9.3f) se(%9.3f) ///
-    stats(N r2_a, labels("Observations" "Adj. R²") fmt(%9.0fc %9.3f)) ///
-    title("第{chapter}章 回归结果") ///
-    mtitles("OLS" "PSM-DID" "平行趋势") ///
-    note("括号内为聚类稳健标准误; *** p<0.01, ** p<0.05, * p<0.10")
-
-* ============================================================
-* End of Chapter {chapter}
-* ============================================================
-"""
         with open(do_path, "w", encoding="utf-8") as f:
-            f.write(code)
-        print(f"  Stata代码已保存: {do_path}")
+            f.write("\n".join(code_lines))
+
+        log.info(f"  Stata代码: {do_path}")
 
 
 if __name__ == "__main__":
